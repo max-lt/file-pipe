@@ -10,7 +10,6 @@ use tokio::sync::{Mutex, Notify, RwLock};
 pub struct PipeMetadata {
     pub content_length: Option<u64>,
     pub reader_count: u32,
-    pub upload_started_at: Instant,
     pub upload_ended_at: Option<Instant>,
     pub first_get_at: Option<Instant>,
     pub last_get_at: Option<Instant>,

@@ -49,15 +49,6 @@ async fn handle_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    // Reject if key already exists
-    {
-        let map = state.pipes.read().await;
-
-        if map.contains_key(&key) {
-            return PipeError::KeyAlreadyExists.into_response();
-        }
-    }
-
     // Create temp file for buffering
     let file_path = state.data_dir.join(format!(
         "pipe-{}-{}",
@@ -82,7 +73,6 @@ async fn handle_put(
         meta: tokio::sync::Mutex::new(PipeMetadata {
             content_length,
             reader_count: 0,
-            upload_started_at: Instant::now(),
             upload_ended_at: None,
             first_get_at: None,
             last_get_at: None,
@@ -94,8 +84,16 @@ async fn handle_put(
         notify: tokio::sync::Notify::new(),
     });
 
+    // Check-and-insert under a single write lock to avoid TOCTOU race
     {
         let mut map = state.pipes.write().await;
+
+        if map.contains_key(&key) {
+            // Clean up the file we just created
+            let _ = std::fs::remove_file(&entry.path);
+            return PipeError::KeyAlreadyExists.into_response();
+        }
+
         map.insert(key.clone(), entry.clone());
     }
 
@@ -114,25 +112,28 @@ async fn handle_put(
                     if !data.is_empty() {
                         let len = data.len() as u64;
 
-                        // Check disk quota before writing
+                        // Reserve disk quota optimistically to avoid TOCTOU
                         if let Some(max) = state.max_disk_usage {
-                            let current = state.disk_usage.load(Ordering::Relaxed);
+                            let prev = state.disk_usage.fetch_add(len, Ordering::Relaxed);
 
-                            if current + len > max {
+                            if prev + len > max {
+                                state.disk_usage.fetch_sub(len, Ordering::Relaxed);
                                 entry.done.store(true, Ordering::Release);
                                 entry.notify.notify_waiters();
                                 return PipeError::DiskQuotaExceeded.into_response();
                             }
+                        } else {
+                            state.disk_usage.fetch_add(len, Ordering::Relaxed);
                         }
 
                         // Write to disk (single writer, no lock needed)
                         if let Err(e) = (&entry.file).write_all(&data) {
+                            // Roll back the reserved quota
+                            state.disk_usage.fetch_sub(len, Ordering::Relaxed);
                             entry.done.store(true, Ordering::Release);
                             entry.notify.notify_waiters();
                             return PipeError::from_io(e).into_response();
                         }
-
-                        state.disk_usage.fetch_add(len, Ordering::Relaxed);
                         // Release ordering: readers must see the file data before the updated counter
                         entry.written.fetch_add(len, Ordering::Release);
                         entry.notify.notify_waiters();
