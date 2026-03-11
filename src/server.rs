@@ -41,7 +41,7 @@ pub struct ServerHandle {
 impl ServerHandle {
     /// Start draining: reject new PUTs with 503, but let existing transfers finish.
     pub fn drain(&self) {
-        self.state.draining.store(true, Ordering::Relaxed);
+        self.state.draining.store(true, Ordering::Release);
     }
 
     /// Remove all temp files for active pipes.

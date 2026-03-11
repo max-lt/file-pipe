@@ -27,7 +27,7 @@ pub async fn create_rw(path: &Path) -> io::Result<File> {
             .open(&path)
     })
     .await
-    .expect("spawn_blocking panicked")
+    .unwrap_or_else(|e| Err(io::Error::other(e)))
 }
 
 /// Write `data` to `file` at the given byte offset (pwrite).
@@ -42,7 +42,7 @@ pub async fn write_at(file: File, data: &[u8], offset: u64) -> io::Result<File> 
         Ok(file)
     })
     .await
-    .expect("spawn_blocking panicked")
+    .unwrap_or_else(|e| Err(io::Error::other(e)))
 }
 
 /// Read up to `len` bytes from `file` at the given byte offset (pread).
@@ -57,7 +57,7 @@ pub async fn read_at(file: File, offset: u64, len: usize) -> io::Result<(Vec<u8>
         Ok((buf, file))
     })
     .await
-    .expect("spawn_blocking panicked")
+    .unwrap_or_else(|e| Err(io::Error::other(e)))
 }
 
 /// Remove a file from disk.
@@ -66,5 +66,5 @@ pub async fn remove(path: &Path) -> io::Result<()> {
 
     tokio::task::spawn_blocking(move || std::fs::remove_file(&path))
         .await
-        .expect("spawn_blocking panicked")
+        .unwrap_or_else(|e| Err(io::Error::other(e)))
 }

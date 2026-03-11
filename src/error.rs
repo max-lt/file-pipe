@@ -8,6 +8,7 @@ pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
 pub enum PipeError {
     EmptyKey,
+    KeyTooLong,
     MethodNotAllowed,
     KeyAlreadyExists,
     KeyNotFound,
@@ -32,7 +33,7 @@ impl PipeError {
 
     fn status(&self) -> StatusCode {
         match self {
-            Self::EmptyKey => StatusCode::BAD_REQUEST,
+            Self::EmptyKey | Self::KeyTooLong => StatusCode::BAD_REQUEST,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::KeyAlreadyExists => StatusCode::CONFLICT,
             Self::KeyNotFound => StatusCode::NOT_FOUND,
@@ -48,6 +49,7 @@ impl PipeError {
     fn message(&self) -> String {
         match self {
             Self::EmptyKey => "missing key in path".into(),
+            Self::KeyTooLong => "key exceeds 512 bytes".into(),
             Self::MethodNotAllowed => "only PUT and GET are supported".into(),
             Self::KeyAlreadyExists => "key already exists".into(),
             Self::KeyNotFound => "key not found".into(),

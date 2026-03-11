@@ -36,6 +36,10 @@ pub async fn handle(
         return Ok(PipeError::EmptyKey.into_response());
     }
 
+    if key.len() > 512 {
+        return Ok(PipeError::KeyTooLong.into_response());
+    }
+
     match *req.method() {
         Method::PUT => Ok(handle_put(key, req, state).await),
         Method::GET => Ok(handle_get(key, state).await),
@@ -171,14 +175,9 @@ async fn stream_multipart(
     state: Arc<AppState>,
 ) -> Response<BoxBody> {
     let stream = body.into_data_stream();
-    // Limit multipart header sizes to prevent abuse.
-    // Field data size is unlimited here — enforced by our own disk/memory quotas.
-    let constraints = multer::Constraints::new().size_limit(
-        multer::SizeLimit::new()
-            .whole_stream(u64::MAX)
-            .per_field(u64::MAX),
-    );
-    let mut multipart = multer::Multipart::with_constraints(stream, boundary, constraints);
+    // Multer defaults are u64::MAX for stream/field sizes — our own
+    // disk/memory quotas handle data limits, so no constraints needed.
+    let mut multipart = multer::Multipart::new(stream, boundary);
 
     // Find the first field (we only support a single file per upload)
     let field = match multipart.next_field().await {
@@ -404,11 +403,26 @@ async fn write_to_disk(
     }
 
     let file_guard = entry.file.lock().await;
-    let file = file_guard
-        .as_ref()
-        .unwrap()
-        .try_clone()
-        .expect("failed to clone file handle");
+    let file = match file_guard.as_ref() {
+        Some(f) => match f.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                drop(file_guard);
+                state.disk_usage.fetch_sub(len, Ordering::Relaxed);
+                entry.done.store(true, Ordering::Release);
+                entry.notify.notify_waiters();
+                return Err(PipeError::from_io(e).into_response());
+            }
+        },
+        None => {
+            drop(file_guard);
+            state.disk_usage.fetch_sub(len, Ordering::Relaxed);
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            return Err(PipeError::IoError(std::io::Error::other("missing file handle"))
+                .into_response());
+        }
+    };
     drop(file_guard);
 
     let offset = entry.written.load(Ordering::Relaxed);
@@ -527,11 +541,13 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
                 } else {
                     // Read from disk using pread — clone handle once, reuse it
                     let file_guard = entry.file.lock().await;
-                    let mut file = file_guard
-                        .as_ref()
-                        .unwrap()
-                        .try_clone()
-                        .expect("failed to clone file handle");
+                    let mut file = match file_guard.as_ref().and_then(|f| f.try_clone().ok()) {
+                        Some(f) => f,
+                        None => {
+                            eprintln!("[GET] failed to clone file handle");
+                            return;
+                        }
+                    };
                     drop(file_guard);
 
                     while pos < written {
