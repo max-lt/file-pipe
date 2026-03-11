@@ -340,21 +340,27 @@ async fn spill_to_disk(
         }
     };
 
-    if let Err(e) = crate::io::write_at(&file, &buf, 0).await {
-        state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
-        drop(buf);
-        entry.done.store(true, Ordering::Release);
-        entry.notify.notify_waiters();
-        return Err(PipeError::from_io(e).into_response());
-    }
+    let file = match crate::io::write_at(file, &buf, 0).await {
+        Ok(f) => f,
+        Err(e) => {
+            state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
+            drop(buf);
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            return Err(PipeError::from_io(e).into_response());
+        }
+    };
 
-    if let Err(e) = crate::io::write_at(&file, new_data, buf_len).await {
-        state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
-        drop(buf);
-        entry.done.store(true, Ordering::Release);
-        entry.notify.notify_waiters();
-        return Err(PipeError::from_io(e).into_response());
-    }
+    let file = match crate::io::write_at(file, new_data, buf_len).await {
+        Ok(f) => f,
+        Err(e) => {
+            state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
+            drop(buf);
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            return Err(PipeError::from_io(e).into_response());
+        }
+    };
 
     drop(buf);
 
@@ -398,18 +404,21 @@ async fn write_to_disk(
     }
 
     let file_guard = entry.file.lock().await;
-    let file = file_guard.as_ref().unwrap();
+    let file = file_guard
+        .as_ref()
+        .unwrap()
+        .try_clone()
+        .expect("failed to clone file handle");
+    drop(file_guard);
+
     let offset = entry.written.load(Ordering::Relaxed);
 
     if let Err(e) = crate::io::write_at(file, data, offset).await {
-        drop(file_guard);
         state.disk_usage.fetch_sub(len, Ordering::Relaxed);
         entry.done.store(true, Ordering::Release);
         entry.notify.notify_waiters();
         return Err(PipeError::from_io(e).into_response());
     }
-
-    drop(file_guard);
     entry.written.fetch_add(len, Ordering::Release);
     entry.notify.notify_waiters();
 
@@ -516,9 +525,11 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
                         return;
                     }
                 } else {
-                    // Read from disk using pread — clone handle once, release lock
+                    // Read from disk using pread — clone handle once, reuse it
                     let file_guard = entry.file.lock().await;
-                    let file = file_guard.as_ref().unwrap()
+                    let mut file = file_guard
+                        .as_ref()
+                        .unwrap()
                         .try_clone()
                         .expect("failed to clone file handle");
                     drop(file_guard);
@@ -526,8 +537,9 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
                     while pos < written {
                         let to_read = std::cmp::min(READ_BUF_SIZE as u64, written - pos) as usize;
 
-                        match crate::io::read_at(&file, pos, to_read).await {
-                            Ok(buf) if !buf.is_empty() => {
+                        match crate::io::read_at(file, pos, to_read).await {
+                            Ok((buf, f)) if !buf.is_empty() => {
+                                file = f;
                                 pos += buf.len() as u64;
 
                                 if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {

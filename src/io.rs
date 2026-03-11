@@ -3,6 +3,9 @@
 //! All operations are dispatched to the tokio blocking thread pool via
 //! `spawn_blocking`. This keeps the async runtime free for network I/O.
 //!
+//! Both `write_at` and `read_at` take an owned `File` and return it on
+//! success, allowing callers to reuse the handle without extra `dup(2)`.
+//!
 //! When `tokio-uring` matures enough to run on the standard tokio runtime,
 //! a Linux-specific implementation using io_uring can be swapped in here
 //! behind `#[cfg(target_os = "linux")]`.
@@ -28,29 +31,30 @@ pub async fn create_rw(path: &Path) -> io::Result<File> {
 }
 
 /// Write `data` to `file` at the given byte offset (pwrite).
-pub async fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
+/// Returns the file handle on success so the caller can reuse it.
+pub async fn write_at(file: File, data: &[u8], offset: u64) -> io::Result<File> {
     use std::os::unix::fs::FileExt;
 
-    let file = file.try_clone()?;
     let data = data.to_vec();
 
-    tokio::task::spawn_blocking(move || file.write_all_at(&data, offset))
-        .await
-        .expect("spawn_blocking panicked")
+    tokio::task::spawn_blocking(move || {
+        file.write_all_at(&data, offset)?;
+        Ok(file)
+    })
+    .await
+    .expect("spawn_blocking panicked")
 }
 
 /// Read up to `len` bytes from `file` at the given byte offset (pread).
-/// Returns the bytes actually read (may be shorter at EOF).
-pub async fn read_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+/// Returns the bytes read and the file handle so the caller can reuse it.
+pub async fn read_at(file: File, offset: u64, len: usize) -> io::Result<(Vec<u8>, File)> {
     use std::os::unix::fs::FileExt;
-
-    let file = file.try_clone()?;
 
     tokio::task::spawn_blocking(move || {
         let mut buf = vec![0u8; len];
         let n = file.read_at(&mut buf, offset)?;
         buf.truncate(n);
-        Ok(buf)
+        Ok((buf, file))
     })
     .await
     .expect("spawn_blocking panicked")
