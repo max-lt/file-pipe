@@ -226,9 +226,11 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
             // Register interest BEFORE checking to avoid missed notifications
             let notified = entry.notify.notified();
 
-            // Acquire ordering: ensures we see file data written before the counter update
-            let written = entry.written.load(Ordering::Acquire);
+            // Load done BEFORE written: if done is true, the Acquire synchronizes
+            // with the writer's Release on done (which happens after Release on written),
+            // guaranteeing we see the final written value.
             let is_done = entry.done.load(Ordering::Acquire);
+            let written = entry.written.load(Ordering::Acquire);
 
             // Read all available data from disk using pread (no seek, no lock)
             while pos < written {
