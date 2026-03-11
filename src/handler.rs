@@ -50,7 +50,7 @@ async fn handle_put(
     req: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Response<BoxBody> {
-    if state.draining.load(Ordering::Relaxed) {
+    if state.draining.load(Ordering::Acquire) {
         return PipeError::Draining.into_response();
     }
 
@@ -134,14 +134,15 @@ async fn stream_raw(
                 if let Ok(data) = frame.into_data() {
                     if !data.is_empty() {
                         if let Err(resp) = write_chunk(&entry, &state, &data).await {
+                            // done already set inside write_chunk
+                            schedule_cleanup(key, state);
                             return resp;
                         }
                     }
                 }
             }
             Some(Err(e)) => {
-                entry.done.store(true, Ordering::Release);
-                entry.notify.notify_waiters();
+                fail_upload(key, &entry, state);
                 return PipeError::UploadError(e).into_response();
             }
             None => {
@@ -170,13 +171,11 @@ async fn stream_multipart(
     let field = match multipart.next_field().await {
         Ok(Some(f)) => f,
         Ok(None) => {
-            entry.done.store(true, Ordering::Release);
-            entry.notify.notify_waiters();
+            fail_upload(key, &entry, state);
             return PipeError::EmptyMultipart.into_response();
         }
         Err(e) => {
-            entry.done.store(true, Ordering::Release);
-            entry.notify.notify_waiters();
+            fail_upload(key, &entry, state);
             return PipeError::MultipartError(e).into_response();
         }
     };
@@ -206,6 +205,8 @@ async fn stream_multipart(
             Ok(Some(data)) => {
                 if !data.is_empty() {
                     if let Err(resp) = write_chunk(&entry, &state, &data).await {
+                        // done already set inside write_chunk
+                        schedule_cleanup(key, state);
                         return resp;
                     }
                 }
@@ -215,8 +216,7 @@ async fn stream_multipart(
                 break;
             }
             Err(e) => {
-                entry.done.store(true, Ordering::Release);
-                entry.notify.notify_waiters();
+                fail_upload(key, &entry, state);
                 return PipeError::MultipartError(e).into_response();
             }
         }
@@ -243,6 +243,13 @@ fn schedule_cleanup(key: String, state: Arc<AppState>) {
         tokio::time::sleep(Duration::from_secs(30)).await;
         cleanup_key(&state, &key).await;
     });
+}
+
+/// Mark upload as failed and schedule cleanup so the entry doesn't leak.
+fn fail_upload(key: String, entry: &PipeEntry, state: Arc<AppState>) {
+    entry.done.store(true, Ordering::Release);
+    entry.notify.notify_waiters();
+    schedule_cleanup(key, state);
 }
 
 /// Write a chunk to the pipe, handling memory → disk spill and quota.
@@ -343,10 +350,13 @@ async fn spill_to_disk(
     state.memory_usage.fetch_sub(buf_len, Ordering::Relaxed);
 
     *entry.file.lock().await = Some(file);
-    entry.spilled.store(true, Ordering::Release);
+    // Bump written BEFORE setting spilled: readers load spilled before
+    // written, so if a reader sees spilled=false it will never see a
+    // written value that exceeds the in-memory buffer length.
     entry
         .written
         .fetch_add(new_data.len() as u64, Ordering::Release);
+    entry.spilled.store(true, Ordering::Release);
     entry.notify.notify_waiters();
 
     Ok(())
@@ -450,8 +460,12 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
             let notified = entry.notify.notified();
 
             let is_done = entry.done.load(Ordering::Acquire);
-            let written = entry.written.load(Ordering::Acquire);
+            // Load spilled BEFORE written: if we see spilled=false, the
+            // written value we load next cannot exceed the buffer length.
+            // The writer in spill_to_disk bumps written BEFORE setting
+            // spilled=true, so this ordering is safe.
             let spilled = entry.spilled.load(Ordering::Acquire);
+            let written = entry.written.load(Ordering::Acquire);
 
             if pos < written {
                 if !spilled {

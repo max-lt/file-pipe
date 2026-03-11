@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::Duration;
 
@@ -527,4 +528,351 @@ async fn raw_upload_preserves_content_type() {
         "image/png"
     );
     assert_eq!(resp.text().await.unwrap(), "fake png data");
+}
+
+// --- Spill during active streaming ---
+
+#[tokio::test]
+async fn reader_survives_spill_during_streaming() {
+    // spill_threshold=64 so the first few chunks stay in memory, then spill to disk.
+    // A reader actively streaming should receive all data correctly across the transition.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        spill_threshold: 64,
+        ..Default::default()
+    })
+    .await;
+    let base = base_url(&srv);
+    let base2 = base.clone();
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+    // PUT with streaming body
+    let put_handle = tokio::spawn(async move {
+        Client::new()
+            .put(format!("{base2}/spill-stream"))
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // GET starts while upload is still in memory
+    let get_handle = tokio::spawn(async move {
+        let resp = Client::new()
+            .get(format!("{base}/spill-stream"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+
+        let mut stream = resp.bytes_stream();
+        let mut received = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+
+        received
+    });
+
+    // Send small chunks that fit in memory (< 64 bytes)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    body_tx.send(Ok(Bytes::from("A".repeat(30)))).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    body_tx.send(Ok(Bytes::from("B".repeat(30)))).await.unwrap();
+
+    // This chunk should trigger the spill (total > 64)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    body_tx.send(Ok(Bytes::from("C".repeat(30)))).await.unwrap();
+
+    // More data after spill
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    body_tx.send(Ok(Bytes::from("D".repeat(30)))).await.unwrap();
+
+    drop(body_tx);
+
+    let resp = put_handle.await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let received = get_handle.await.unwrap();
+    let expected = format!(
+        "{}{}{}{}",
+        "A".repeat(30),
+        "B".repeat(30),
+        "C".repeat(30),
+        "D".repeat(30)
+    );
+    assert_eq!(received.len(), expected.len());
+    assert_eq!(String::from_utf8(received).unwrap(), expected);
+}
+
+// --- Concurrent readers during live streaming ---
+
+#[tokio::test]
+async fn multiple_readers_during_active_streaming() {
+    let srv = spawn_server().await;
+    let base = Arc::new(base_url(&srv));
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+    let base_put = base.clone();
+
+    tokio::spawn(async move {
+        Client::new()
+            .put(format!("{base_put}/live-multi"))
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Spawn 3 concurrent readers
+    let mut get_handles = Vec::new();
+
+    for _ in 0..3 {
+        let base_get = base.clone();
+
+        get_handles.push(tokio::spawn(async move {
+            let resp = Client::new()
+                .get(format!("{base_get}/live-multi"))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), 200);
+
+            let mut stream = resp.bytes_stream();
+            let mut received = Vec::new();
+
+            while let Some(chunk) = stream.next().await {
+                received.extend_from_slice(&chunk.unwrap());
+            }
+
+            received
+        }));
+    }
+
+    // Send data while readers are active
+    for i in 0..5 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        body_tx
+            .send(Ok(Bytes::from(format!("chunk{i}"))))
+            .await
+            .unwrap();
+    }
+
+    drop(body_tx);
+
+    let expected = "chunk0chunk1chunk2chunk3chunk4";
+
+    for handle in get_handles {
+        let received = handle.await.unwrap();
+        assert_eq!(String::from_utf8(received).unwrap(), expected);
+    }
+}
+
+// --- Large file through disk spill with integrity check ---
+
+#[tokio::test]
+async fn large_file_through_disk_spill() {
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        spill_threshold: 1024, // 1KB threshold
+        ..Default::default()
+    })
+    .await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // 100KB of patterned data to verify integrity
+    let data: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
+    let expected = data.clone();
+
+    client
+        .put(format!("{base}/bigfile"))
+        .body(data)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .get(format!("{base}/bigfile"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let received = resp.bytes().await.unwrap();
+    assert_eq!(received.len(), expected.len());
+    assert_eq!(received.as_ref(), expected.as_slice());
+}
+
+// --- Writer disconnect mid-upload ---
+
+#[tokio::test]
+async fn writer_disconnect_mid_upload() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let base2 = base.clone();
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+    let put_handle = tokio::spawn(async move {
+        // This may succeed or fail depending on timing — we don't care about the PUT response
+        let _ = Client::new()
+            .put(format!("{base2}/disconnect"))
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Start reading
+    let get_handle = tokio::spawn(async move {
+        let resp = Client::new()
+            .get(format!("{base}/disconnect"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+
+        let mut stream = resp.bytes_stream();
+        let mut received = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(data) => received.extend_from_slice(&data),
+                Err(_) => break,
+            }
+        }
+
+        received
+    });
+
+    // Send some data then drop (disconnect)
+    body_tx.send(Ok(Bytes::from("partial"))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(body_tx);
+
+    put_handle.await.unwrap();
+    let received = get_handle.await.unwrap();
+
+    // Reader should have received whatever was sent before disconnect
+    assert_eq!(String::from_utf8(received).unwrap(), "partial");
+}
+
+// --- Key reuse after cleanup ---
+
+#[tokio::test]
+async fn key_reusable_after_cleanup() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // First upload
+    client
+        .put(format!("{base}/reuse"))
+        .body("first")
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .get(format!("{base}/reuse"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.text().await.unwrap(), "first");
+
+    // Wait for cleanup (5s after first GET + margin)
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // Key should be gone — reuse it
+    client
+        .put(format!("{base}/reuse"))
+        .body("second")
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .get(format!("{base}/reuse"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "second");
+}
+
+// --- Multipart large file through disk spill ---
+
+#[tokio::test]
+async fn multipart_large_file_spills_to_disk() {
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        spill_threshold: 512,
+        ..Default::default()
+    })
+    .await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // 10KB patterned data via multipart
+    let data: Vec<u8> = (0..10_000).map(|i| (i % 199) as u8).collect();
+    let expected = data.clone();
+
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(data)
+            .file_name("big.bin")
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    );
+
+    let resp = client
+        .put(format!("{base}/mp-big"))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .get(format!("{base}/mp-big"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        "application/octet-stream"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "attachment; filename=\"big.bin\""
+    );
+
+    let received = resp.bytes().await.unwrap();
+    assert_eq!(received.len(), expected.len());
+    assert_eq!(received.as_ref(), expected.as_slice());
 }
