@@ -559,9 +559,17 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
     }
 
     if let Some(ref name) = filename {
+        // Sanitize: strip control chars (CR, LF, NUL) to prevent header injection,
+        // and escape quotes for the quoted-string.
+        let safe: String = name
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let safe = safe.replace('"', "\\\"");
+
         response = response.header(
             hyper::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", name.replace('"', "\\\""))
+            format!("attachment; filename=\"{safe}\""),
         );
     }
 

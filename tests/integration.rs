@@ -535,6 +535,57 @@ async fn raw_upload_preserves_content_type() {
     assert_eq!(resp.text().await.unwrap(), "fake png data");
 }
 
+// --- Filename sanitization (header injection prevention) ---
+
+#[tokio::test]
+async fn multipart_filename_control_chars_are_stripped() {
+    // Defense-in-depth: control characters in filenames are stripped from
+    // the Content-Disposition response header. We craft a raw multipart body
+    // with a null byte in the filename, since \r\n can't survive multipart framing.
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let boundary = "----testboundary9876";
+    let mut body = Vec::new();
+    body.extend_from_slice(b"------testboundary9876\r\n");
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"file\"; filename=\"evil\tfile.txt\"\r\n");
+    body.extend_from_slice(b"Content-Type: text/plain\r\n");
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(b"payload\r\n");
+    body.extend_from_slice(b"------testboundary9876--\r\n");
+
+    let resp = client
+        .put(format!("{base}/inject"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let resp = client.get(format!("{base}/inject")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let cd = resp
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap();
+
+    // No control chars should survive in the header value
+    assert!(
+        !cd.chars().any(|c| c.is_control()),
+        "Content-Disposition contains control chars: {cd:?}"
+    );
+    assert!(cd.contains("filename="));
+}
+
 // --- Spill during active streaming ---
 
 #[tokio::test]
