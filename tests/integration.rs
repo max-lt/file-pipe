@@ -434,3 +434,97 @@ async fn spill_threshold_forces_disk() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), data);
 }
+
+#[tokio::test]
+async fn multipart_upload_preserves_filename_and_mime() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(b"hello multipart".to_vec())
+            .file_name("report.pdf")
+            .mime_str("application/pdf")
+            .unwrap(),
+    );
+
+    let resp = client
+        .put(format!("{base}/mp"))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let resp = client.get(format!("{base}/mp")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    assert_eq!(
+        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        "application/pdf"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "attachment; filename=\"report.pdf\""
+    );
+
+    assert_eq!(resp.text().await.unwrap(), "hello multipart");
+}
+
+#[tokio::test]
+async fn multipart_upload_without_metadata() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // Part without filename or explicit mime type
+    let form = reqwest::multipart::Form::new()
+        .part("data", reqwest::multipart::Part::bytes(b"just data".to_vec()));
+
+    let resp = client
+        .put(format!("{base}/mp-plain"))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let resp = client.get(format!("{base}/mp-plain")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // No Content-Disposition since there was no filename
+    assert!(resp.headers().get("content-disposition").is_none());
+    assert_eq!(resp.text().await.unwrap(), "just data");
+}
+
+#[tokio::test]
+async fn raw_upload_preserves_content_type() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let resp = client
+        .put(format!("{base}/typed"))
+        .header("content-type", "image/png")
+        .body("fake png data")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let resp = client.get(format!("{base}/typed")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        "image/png"
+    );
+    assert_eq!(resp.text().await.unwrap(), "fake png data");
+}

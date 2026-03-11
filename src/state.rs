@@ -9,6 +9,8 @@ use tokio::sync::{Mutex, Notify, RwLock};
 /// Metadata behind a mutex — only accessed for first GET, not on the hot path.
 pub struct PipeMetadata {
     pub content_length: Option<u64>,
+    pub mime_type: Option<String>,
+    pub filename: Option<String>,
     pub reader_count: u32,
     pub upload_ended_at: Option<Instant>,
     pub first_get_at: Option<Instant>,

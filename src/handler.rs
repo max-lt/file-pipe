@@ -15,6 +15,17 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::error::{BoxBody, PipeError, ok_response};
 use crate::state::{AppState, PipeEntry, PipeMetadata, cleanup_key};
 
+/// Extract the multipart boundary from Content-Type, if present.
+fn multipart_boundary(req: &Request<Incoming>) -> Option<String> {
+    let ct = req.headers().get(hyper::header::CONTENT_TYPE)?.to_str().ok()?;
+
+    if !ct.starts_with("multipart/form-data") {
+        return None;
+    }
+
+    multer::parse_boundary(ct).ok()
+}
+
 const READ_BUF_SIZE: usize = 64 * 1024;
 
 pub async fn handle(
@@ -43,11 +54,23 @@ async fn handle_put(
         return PipeError::Draining.into_response();
     }
 
+    let boundary = multipart_boundary(&req);
+
     let content_length = req
         .headers()
         .get(hyper::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
+
+    // For raw uploads, capture Content-Type if provided
+    let raw_content_type = if boundary.is_none() {
+        req.headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    } else {
+        None
+    };
 
     // Create temp file path (file created lazily on spill)
     let file_path = state.data_dir.join(format!(
@@ -59,6 +82,8 @@ async fn handle_put(
     let entry = Arc::new(PipeEntry {
         meta: tokio::sync::Mutex::new(PipeMetadata {
             content_length,
+            mime_type: raw_content_type,
+            filename: None,
             reader_count: 0,
             upload_ended_at: None,
             first_get_at: None,
@@ -89,9 +114,20 @@ async fn handle_put(
 
     eprintln!("[PUT] key={key} upload started");
 
-    // Stream the request body
-    let mut body = req.into_body();
+    if let Some(boundary) = boundary {
+        stream_multipart(key, req.into_body(), boundary, entry, state).await
+    } else {
+        stream_raw(key, req.into_body(), entry, state).await
+    }
+}
 
+/// Stream a raw (non-multipart) body into the pipe.
+async fn stream_raw(
+    key: String,
+    mut body: Incoming,
+    entry: Arc<PipeEntry>,
+    state: Arc<AppState>,
+) -> Response<BoxBody> {
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
@@ -109,30 +145,104 @@ async fn handle_put(
                 return PipeError::UploadError(e).into_response();
             }
             None => {
-                let total_bytes = entry.written.load(Ordering::Relaxed);
-                let spilled = entry.spilled.load(Ordering::Relaxed);
-                entry.meta.lock().await.upload_ended_at = Some(Instant::now());
-                entry.done.store(true, Ordering::Release);
-                entry.notify.notify_waiters();
-                eprintln!(
-                    "[PUT] key={key} upload complete: {total_bytes} bytes ({})",
-                    if spilled { "disk" } else { "memory" }
-                );
+                finalize_upload(&key, &entry).await;
                 break;
             }
         }
     }
 
-    // Cleanup 30s after upload ends
-    let state_clone = state.clone();
-    let key_clone = key.clone();
+    schedule_cleanup(key, state);
+    ok_response()
+}
 
+/// Parse a multipart body, extract the first file field, and stream it into the pipe.
+async fn stream_multipart(
+    key: String,
+    body: Incoming,
+    boundary: String,
+    entry: Arc<PipeEntry>,
+    state: Arc<AppState>,
+) -> Response<BoxBody> {
+    let stream = body.into_data_stream();
+    let mut multipart = multer::Multipart::new(stream, boundary);
+
+    // Find the first field (we only support a single file per upload)
+    let field = match multipart.next_field().await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            return PipeError::EmptyMultipart.into_response();
+        }
+        Err(e) => {
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            return PipeError::MultipartError(e).into_response();
+        }
+    };
+
+    // Extract metadata from the field before consuming it
+    {
+        let mut meta = entry.meta.lock().await;
+        meta.filename = field.file_name().map(String::from);
+        meta.mime_type = field.content_type().map(|m| m.to_string());
+
+        // Content-Length from the outer request includes multipart framing,
+        // so it's not meaningful for the file itself — clear it.
+        meta.content_length = None;
+    }
+
+    eprintln!(
+        "[PUT] key={key} multipart file={:?} type={:?}",
+        field.file_name().map(String::from),
+        field.content_type().map(|m| m.to_string()),
+    );
+
+    // Stream the field data
+    let mut field = field;
+
+    loop {
+        match field.chunk().await {
+            Ok(Some(data)) => {
+                if !data.is_empty() {
+                    if let Err(resp) = write_chunk(&entry, &state, &data).await {
+                        return resp;
+                    }
+                }
+            }
+            Ok(None) => {
+                finalize_upload(&key, &entry).await;
+                break;
+            }
+            Err(e) => {
+                entry.done.store(true, Ordering::Release);
+                entry.notify.notify_waiters();
+                return PipeError::MultipartError(e).into_response();
+            }
+        }
+    }
+
+    schedule_cleanup(key, state);
+    ok_response()
+}
+
+async fn finalize_upload(key: &str, entry: &PipeEntry) {
+    let total_bytes = entry.written.load(Ordering::Relaxed);
+    let spilled = entry.spilled.load(Ordering::Relaxed);
+    entry.meta.lock().await.upload_ended_at = Some(Instant::now());
+    entry.done.store(true, Ordering::Release);
+    entry.notify.notify_waiters();
+    eprintln!(
+        "[PUT] key={key} upload complete: {total_bytes} bytes ({})",
+        if spilled { "disk" } else { "memory" }
+    );
+}
+
+fn schedule_cleanup(key: String, state: Arc<AppState>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        cleanup_key(&state_clone, &key_clone).await;
+        cleanup_key(&state, &key).await;
     });
-
-    ok_response()
 }
 
 /// Write a chunk to the pipe, handling memory → disk spill and quota.
@@ -306,7 +416,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
     };
 
     // Update metadata (behind mutex, but only once per GET — not on hot path)
-    let content_length = {
+    let (content_length, mime_type, filename) = {
         let mut meta = entry.meta.lock().await;
         meta.reader_count += 1;
         let now = Instant::now();
@@ -327,7 +437,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         meta.last_get_at = Some(now);
         let reader_num = meta.reader_count;
         eprintln!("[GET] key={key} reader #{reader_num}");
-        meta.content_length
+        (meta.content_length, meta.mime_type.clone(), meta.filename.clone())
     };
 
     // Stream the response
@@ -399,6 +509,17 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
 
     if let Some(len) = content_length {
         response = response.header(hyper::header::CONTENT_LENGTH, len);
+    }
+
+    if let Some(ref mime) = mime_type {
+        response = response.header(hyper::header::CONTENT_TYPE, mime.as_str());
+    }
+
+    if let Some(ref name) = filename {
+        response = response.header(
+            hyper::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", name.replace('"', "\\\""))
+        );
     }
 
     response.body(body).unwrap()

@@ -15,6 +15,8 @@ pub enum PipeError {
     TooManyOpenFiles,
     DiskFull,
     DiskQuotaExceeded,
+    EmptyMultipart,
+    MultipartError(multer::Error),
     IoError(std::io::Error),
     UploadError(hyper::Error),
 }
@@ -34,6 +36,8 @@ impl PipeError {
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::KeyAlreadyExists => StatusCode::CONFLICT,
             Self::KeyNotFound => StatusCode::NOT_FOUND,
+            Self::EmptyMultipart => StatusCode::BAD_REQUEST,
+            Self::MultipartError(_) => StatusCode::BAD_REQUEST,
             Self::Draining | Self::TooManyOpenFiles | Self::DiskFull | Self::DiskQuotaExceeded => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -51,6 +55,8 @@ impl PipeError {
             Self::TooManyOpenFiles => "too many open files, try again later".into(),
             Self::DiskFull => "disk full, try again later".into(),
             Self::DiskQuotaExceeded => "disk quota exceeded, try again later".into(),
+            Self::EmptyMultipart => "multipart body contains no fields".into(),
+            Self::MultipartError(e) => format!("multipart parse error: {e}"),
             Self::IoError(e) => format!("internal error: {e}"),
             Self::UploadError(e) => format!("upload failed: {e}"),
         }
