@@ -8,7 +8,8 @@ async fn main() {
     handle.drain();
 
     wait_for_signal().await;
-    eprintln!("[SHUTDOWN] forced exit");
+    eprintln!("[SHUTDOWN] cleaning up and exiting");
+    handle.cleanup().await;
     std::process::exit(0);
 }
 

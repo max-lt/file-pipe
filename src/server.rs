@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::Write as _;
 use std::net::SocketAddr;
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -16,8 +19,12 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::error::{BoxBody, PipeError, ok_response};
+
+const READ_BUF_SIZE: usize = 64 * 1024;
+
 struct PipeInner {
-    chunks: Vec<Bytes>,
+    written: u64,
     done: bool,
     content_length: Option<u64>,
     reader_count: u32,
@@ -29,6 +36,10 @@ struct PipeInner {
 
 struct PipeEntry {
     inner: Mutex<PipeInner>,
+    /// Shared file handle. Writer appends under the mutex.
+    /// Readers use `read_at()` (pread) with their own offset — no seek, no conflict.
+    file: std::fs::File,
+    path: PathBuf,
     notify: Notify,
 }
 
@@ -36,19 +47,7 @@ pub struct AppState {
     pipes: RwLock<HashMap<String, Arc<PipeEntry>>>,
     key_added: Notify,
     draining: AtomicBool,
-}
-
-type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
-
-fn empty_response(status: StatusCode) -> Response<BoxBody> {
-    Response::builder()
-        .status(status)
-        .body(
-            http_body_util::Empty::new()
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .unwrap()
+    data_dir: PathBuf,
 }
 
 async fn handle(
@@ -58,13 +57,13 @@ async fn handle(
     let key = req.uri().path().trim_start_matches('/').to_string();
 
     if key.is_empty() {
-        return Ok(empty_response(StatusCode::BAD_REQUEST));
+        return Ok(PipeError::EmptyKey.into_response());
     }
 
     match *req.method() {
         Method::PUT => Ok(handle_put(key, req, state).await),
         Method::GET => Ok(handle_get(key, state).await),
-        _ => Ok(empty_response(StatusCode::METHOD_NOT_ALLOWED)),
+        _ => Ok(PipeError::MethodNotAllowed.into_response()),
     }
 }
 
@@ -74,7 +73,7 @@ async fn handle_put(
     state: Arc<AppState>,
 ) -> Response<BoxBody> {
     if state.draining.load(Ordering::Relaxed) {
-        return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+        return PipeError::Draining.into_response();
     }
 
     let content_length = req
@@ -88,13 +87,33 @@ async fn handle_put(
         let map = state.pipes.read().await;
 
         if map.contains_key(&key) {
-            return empty_response(StatusCode::CONFLICT);
+            return PipeError::KeyAlreadyExists.into_response();
         }
     }
 
+    // Create temp file for buffering
+    let file_path = state.data_dir.join(format!(
+        "pipe-{}-{}",
+        std::process::id(),
+        key.replace('/', "_")
+    ));
+
+    let file = match std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&file_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return PipeError::from_io(e).into_response();
+        }
+    };
+
     let entry = Arc::new(PipeEntry {
         inner: Mutex::new(PipeInner {
-            chunks: Vec::new(),
+            written: 0,
             done: false,
             content_length,
             reader_count: 0,
@@ -103,6 +122,8 @@ async fn handle_put(
             first_get_at: None,
             last_get_at: None,
         }),
+        file,
+        path: file_path,
         notify: Notify::new(),
     });
 
@@ -116,7 +137,7 @@ async fn handle_put(
 
     eprintln!("[PUT] key={key} upload started");
 
-    // Stream the request body into the pipe
+    // Stream the request body to disk
     let mut body = req.into_body();
 
     loop {
@@ -124,32 +145,38 @@ async fn handle_put(
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
                     if !data.is_empty() {
+                        // Write to disk (writer is the only one calling write)
+                        if let Err(e) = (&entry.file).write_all(&data) {
+                            let mut inner = entry.inner.lock().await;
+                            inner.done = true;
+                            drop(inner);
+                            entry.notify.notify_waiters();
+                            return PipeError::from_io(e).into_response();
+                        }
+
+                        // Update written counter under the lock
                         let mut inner = entry.inner.lock().await;
-                        inner.chunks.push(data);
+                        inner.written += data.len() as u64;
                         drop(inner);
                         entry.notify.notify_waiters();
                     }
                 }
             }
             Some(Err(e)) => {
-                eprintln!("[PUT] key={key} upload error: {e}");
                 let mut inner = entry.inner.lock().await;
                 inner.done = true;
                 drop(inner);
                 entry.notify.notify_waiters();
-                return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+                return PipeError::UploadError(e).into_response();
             }
             None => {
                 let mut inner = entry.inner.lock().await;
                 inner.done = true;
                 inner.upload_ended_at = Some(Instant::now());
-                let chunks_count = inner.chunks.len();
-                let total_bytes: usize = inner.chunks.iter().map(|c| c.len()).sum();
+                let total_bytes = inner.written;
                 drop(inner);
                 entry.notify.notify_waiters();
-                eprintln!(
-                    "[PUT] key={key} upload complete: {total_bytes} bytes in {chunks_count} chunks"
-                );
+                eprintln!("[PUT] key={key} upload complete: {total_bytes} bytes");
                 break;
             }
         }
@@ -161,13 +188,10 @@ async fn handle_put(
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;
-
-        if state_clone.pipes.write().await.remove(&key_clone).is_some() {
-            eprintln!("[CLEANUP] key={key_clone} removed (30s after upload)");
-        }
+        cleanup_key(&state_clone, &key_clone).await;
     });
 
-    empty_response(StatusCode::OK)
+    ok_response()
 }
 
 async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
@@ -188,8 +212,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         tokio::select! {
             _ = notified => continue,
             _ = tokio::time::sleep_until(deadline) => {
-                eprintln!("[GET] key={key} not found (timeout)");
-                return empty_response(StatusCode::NOT_FOUND);
+                return PipeError::KeyNotFound.into_response();
             }
         }
     };
@@ -209,10 +232,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
 
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-
-                if state_clone.pipes.write().await.remove(&key_clone).is_some() {
-                    eprintln!("[CLEANUP] key={key_clone} removed (5s after first GET)");
-                }
+                cleanup_key(&state_clone, &key_clone).await;
             });
         }
 
@@ -222,26 +242,43 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         inner.content_length
     };
 
-    // Stream the response from the pipe
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
+    // Stream the response using pread (read_at) on the shared file descriptor
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
 
     tokio::spawn(async move {
-        let mut pos = 0;
+        let mut pos: u64 = 0;
+        let mut buf = vec![0u8; READ_BUF_SIZE];
 
         loop {
             // Register interest BEFORE checking to avoid missed notifications
             let notified = entry.notify.notified();
 
-            let (new_chunks, is_done) = {
+            let (written, is_done) = {
                 let inner = entry.inner.lock().await;
-                let chunks: Vec<Bytes> = inner.chunks[pos..].to_vec();
-                pos = inner.chunks.len();
-                (chunks, inner.done)
+                (inner.written, inner.done)
             };
 
-            for chunk in new_chunks {
-                if tx.send(Ok(Frame::data(chunk))).await.is_err() {
-                    return; // Client disconnected
+            // Read all available data from disk using pread (no seek needed)
+            while pos < written {
+                let to_read = std::cmp::min(READ_BUF_SIZE as u64, written - pos) as usize;
+
+                match entry.file.read_at(&mut buf[..to_read], pos) {
+                    Ok(n) if n > 0 => {
+                        pos += n as u64;
+
+                        if tx
+                            .send(Ok(Frame::data(Bytes::copy_from_slice(&buf[..n]))))
+                            .await
+                            .is_err()
+                        {
+                            return; // Client disconnected
+                        }
+                    }
+                    Ok(_) => break, // Short read, wait for more
+                    Err(e) => {
+                        eprintln!("[GET] read error: {e}");
+                        return;
+                    }
                 }
             }
 
@@ -265,6 +302,20 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
     response.body(body).unwrap()
 }
 
+async fn cleanup_key(state: &AppState, key: &str) {
+    let entry = state.pipes.write().await.remove(key);
+
+    if let Some(entry) = entry {
+        if let Err(e) = std::fs::remove_file(&entry.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
+            }
+        }
+
+        eprintln!("[CLEANUP] key={key} removed");
+    }
+}
+
 pub struct ServerHandle {
     pub addr: SocketAddr,
     state: Arc<AppState>,
@@ -275,14 +326,41 @@ impl ServerHandle {
     pub fn drain(&self) {
         self.state.draining.store(true, Ordering::Relaxed);
     }
+
+    /// Remove all temp files for active pipes.
+    pub async fn cleanup(&self) {
+        let mut map = self.state.pipes.write().await;
+        let keys: Vec<String> = map.keys().cloned().collect();
+
+        for key in &keys {
+            if let Some(entry) = map.remove(key) {
+                if let Err(e) = std::fs::remove_file(&entry.path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
+                    }
+                }
+
+                eprintln!("[CLEANUP] key={key} removed");
+            }
+        }
+    }
 }
 
 /// Start the server on the given address.
 pub async fn start_server(addr: &str) -> ServerHandle {
+    start_server_with_data_dir(addr, std::env::temp_dir()).await
+}
+
+/// Start the server with a custom data directory for temp files.
+pub async fn start_server_with_data_dir(addr: &str, data_dir: impl Into<PathBuf>) -> ServerHandle {
+    let data_dir = data_dir.into();
+    std::fs::create_dir_all(&data_dir).expect("failed to create data directory");
+
     let state = Arc::new(AppState {
         pipes: RwLock::new(HashMap::new()),
         key_added: Notify::new(),
         draining: AtomicBool::new(false),
+        data_dir,
     });
 
     let listener = TcpListener::bind(addr).await.unwrap();
@@ -292,7 +370,13 @@ pub async fn start_server(addr: &str) -> ServerHandle {
 
     tokio::spawn(async move {
         loop {
-            let (stream, remote) = listener.accept().await.unwrap();
+            let (stream, remote) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    eprintln!("[ERROR] accept failed: {e}");
+                    continue;
+                }
+            };
             let state = state_clone.clone();
 
             tokio::spawn(async move {
