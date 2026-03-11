@@ -70,11 +70,17 @@ async fn handle_put(
         None
     };
 
-    // Create temp file path (file created lazily on spill)
+    // Create temp file path (file created lazily on spill).
+    // Hash the key to avoid collisions (e.g. "a/b" vs "a_b").
     let file_path = state.data_dir.join(format!(
-        "pipe-{}-{}",
+        "pipe-{}-{:016x}",
         std::process::id(),
-        key.replace('/', "_")
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut h);
+            h.finish()
+        }
     ));
 
     let entry = Arc::new(PipeEntry {

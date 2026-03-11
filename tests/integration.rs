@@ -583,6 +583,43 @@ async fn raw_upload_preserves_content_type() {
     assert_eq!(resp.text().await.unwrap(), "fake png data");
 }
 
+// --- File path collision: keys with / vs _ must not collide ---
+
+#[tokio::test]
+async fn keys_with_slash_vs_underscore_dont_collide() {
+    // Keys "a/b" and "a_b" previously mapped to the same temp file.
+    // Both should store and return their own data independently.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        spill_threshold: 0, // force disk so file paths matter
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    client
+        .put(format!("{base}/a/b"))
+        .body("slash")
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .put(format!("{base}/a_b"))
+        .body("underscore")
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client.get(format!("{base}/a/b")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "slash");
+
+    let resp = client.get(format!("{base}/a_b")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "underscore");
+}
+
 // --- Filename sanitization (header injection prevention) ---
 
 #[tokio::test]
