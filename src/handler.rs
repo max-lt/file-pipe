@@ -9,12 +9,11 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
-use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{BoxBody, PipeError, ok_response};
-use crate::state::{AppState, PipeEntry, PipeInner, cleanup_key};
+use crate::state::{AppState, PipeEntry, PipeMetadata, cleanup_key};
 
 const READ_BUF_SIZE: usize = 64 * 1024;
 
@@ -80,9 +79,7 @@ async fn handle_put(
     };
 
     let entry = Arc::new(PipeEntry {
-        inner: Mutex::new(PipeInner {
-            written: 0,
-            done: false,
+        meta: tokio::sync::Mutex::new(PipeMetadata {
             content_length,
             reader_count: 0,
             upload_started_at: Instant::now(),
@@ -90,6 +87,8 @@ async fn handle_put(
             first_get_at: None,
             last_get_at: None,
         }),
+        written: 0.into(),
+        done: false.into(),
         file,
         path: file_path,
         notify: tokio::sync::Notify::new(),
@@ -120,46 +119,35 @@ async fn handle_put(
                             let current = state.disk_usage.load(Ordering::Relaxed);
 
                             if current + len > max {
-                                let mut inner = entry.inner.lock().await;
-                                inner.done = true;
-                                drop(inner);
+                                entry.done.store(true, Ordering::Release);
                                 entry.notify.notify_waiters();
                                 return PipeError::DiskQuotaExceeded.into_response();
                             }
                         }
 
-                        // Write to disk (writer is the only one calling write)
+                        // Write to disk (single writer, no lock needed)
                         if let Err(e) = (&entry.file).write_all(&data) {
-                            let mut inner = entry.inner.lock().await;
-                            inner.done = true;
-                            drop(inner);
+                            entry.done.store(true, Ordering::Release);
                             entry.notify.notify_waiters();
                             return PipeError::from_io(e).into_response();
                         }
 
                         state.disk_usage.fetch_add(len, Ordering::Relaxed);
-
-                        // Update written counter under the lock
-                        let mut inner = entry.inner.lock().await;
-                        inner.written += len;
-                        drop(inner);
+                        // Release ordering: readers must see the file data before the updated counter
+                        entry.written.fetch_add(len, Ordering::Release);
                         entry.notify.notify_waiters();
                     }
                 }
             }
             Some(Err(e)) => {
-                let mut inner = entry.inner.lock().await;
-                inner.done = true;
-                drop(inner);
+                entry.done.store(true, Ordering::Release);
                 entry.notify.notify_waiters();
                 return PipeError::UploadError(e).into_response();
             }
             None => {
-                let mut inner = entry.inner.lock().await;
-                inner.done = true;
-                inner.upload_ended_at = Some(Instant::now());
-                let total_bytes = inner.written;
-                drop(inner);
+                let total_bytes = entry.written.load(Ordering::Relaxed);
+                entry.meta.lock().await.upload_ended_at = Some(Instant::now());
+                entry.done.store(true, Ordering::Release);
                 entry.notify.notify_waiters();
                 eprintln!("[PUT] key={key} upload complete: {total_bytes} bytes");
                 break;
@@ -202,14 +190,14 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         }
     };
 
-    // Update metadata
+    // Update metadata (behind mutex, but only once per GET — not on hot path)
     let content_length = {
-        let mut inner = entry.inner.lock().await;
-        inner.reader_count += 1;
+        let mut meta = entry.meta.lock().await;
+        meta.reader_count += 1;
         let now = Instant::now();
 
-        if inner.first_get_at.is_none() {
-            inner.first_get_at = Some(now);
+        if meta.first_get_at.is_none() {
+            meta.first_get_at = Some(now);
 
             // Schedule cleanup 5s after first GET
             let state_clone = state.clone();
@@ -221,10 +209,10 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
             });
         }
 
-        inner.last_get_at = Some(now);
-        let reader_num = inner.reader_count;
+        meta.last_get_at = Some(now);
+        let reader_num = meta.reader_count;
         eprintln!("[GET] key={key} reader #{reader_num}");
-        inner.content_length
+        meta.content_length
     };
 
     // Stream the response using pread (read_at) on the shared file descriptor
@@ -232,30 +220,26 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
 
     tokio::spawn(async move {
         let mut pos: u64 = 0;
-        let mut buf = vec![0u8; READ_BUF_SIZE];
 
         loop {
             // Register interest BEFORE checking to avoid missed notifications
             let notified = entry.notify.notified();
 
-            let (written, is_done) = {
-                let inner = entry.inner.lock().await;
-                (inner.written, inner.done)
-            };
+            // Acquire ordering: ensures we see file data written before the counter update
+            let written = entry.written.load(Ordering::Acquire);
+            let is_done = entry.done.load(Ordering::Acquire);
 
-            // Read all available data from disk using pread (no seek needed)
+            // Read all available data from disk using pread (no seek, no lock)
             while pos < written {
                 let to_read = std::cmp::min(READ_BUF_SIZE as u64, written - pos) as usize;
+                let mut buf = vec![0u8; to_read];
 
-                match entry.file.read_at(&mut buf[..to_read], pos) {
+                match entry.file.read_at(&mut buf, pos) {
                     Ok(n) if n > 0 => {
                         pos += n as u64;
+                        buf.truncate(n);
 
-                        if tx
-                            .send(Ok(Frame::data(Bytes::copy_from_slice(&buf[..n]))))
-                            .await
-                            .is_err()
-                        {
+                        if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
                             return; // Client disconnected
                         }
                     }

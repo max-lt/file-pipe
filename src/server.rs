@@ -46,7 +46,7 @@ impl ServerHandle {
 
         for key in &keys {
             if let Some(entry) = map.remove(key) {
-                let written = entry.inner.lock().await.written;
+                let written = entry.written.load(Ordering::Relaxed);
                 self.state.disk_usage.fetch_sub(written, Ordering::Relaxed);
 
                 if let Err(e) = std::fs::remove_file(&entry.path) {

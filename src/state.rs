@@ -6,9 +6,8 @@ use std::time::Instant;
 
 use tokio::sync::{Mutex, Notify, RwLock};
 
-pub struct PipeInner {
-    pub written: u64,
-    pub done: bool,
+/// Metadata behind a mutex — only accessed for first GET, not on the hot path.
+pub struct PipeMetadata {
     pub content_length: Option<u64>,
     pub reader_count: u32,
     pub upload_started_at: Instant,
@@ -18,7 +17,11 @@ pub struct PipeInner {
 }
 
 pub struct PipeEntry {
-    pub inner: Mutex<PipeInner>,
+    pub meta: Mutex<PipeMetadata>,
+    /// Bytes written so far — updated atomically by the writer, read by readers.
+    pub written: AtomicU64,
+    /// Upload complete — set once by the writer, checked by readers.
+    pub done: AtomicBool,
     /// Shared file handle. Writer appends (single writer).
     /// Readers use `read_at()` (pread) with their own offset — no seek, no conflict.
     pub file: std::fs::File,
@@ -39,7 +42,7 @@ pub async fn cleanup_key(state: &AppState, key: &str) {
     let entry = state.pipes.write().await.remove(key);
 
     if let Some(entry) = entry {
-        let written = entry.inner.lock().await.written;
+        let written = entry.written.load(Ordering::Relaxed);
         state.disk_usage.fetch_sub(written, Ordering::Relaxed);
 
         if let Err(e) = std::fs::remove_file(&entry.path) {
