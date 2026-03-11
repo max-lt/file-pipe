@@ -86,6 +86,54 @@ async fn get_timeout_returns_404() {
 }
 
 #[tokio::test]
+async fn second_get_not_stuck_when_first_times_out() {
+    // Two GETs wait on the same key. The first times out after 5s and must
+    // not break the second GET's notification channel. When the PUT arrives
+    // (within the second GET's deadline), the second GET must receive data.
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+
+    // GET-A: will timeout (no PUT within 5s)
+    let base_a = base.clone();
+    let get_a = tokio::spawn(async move {
+        let resp = Client::new()
+            .get(format!("{base_a}/waiter-race"))
+            .send()
+            .await
+            .unwrap();
+        resp.status()
+    });
+
+    // GET-B: starts 1s later, so its 5s deadline extends to ~t+6s
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let base_b = base.clone();
+    let get_b = tokio::spawn(async move {
+        let resp = Client::new()
+            .get(format!("{base_b}/waiter-race"))
+            .send()
+            .await
+            .unwrap();
+        (resp.status(), resp.text().await.unwrap())
+    });
+
+    // PUT arrives at ~t+5.5s — after GET-A's deadline but before GET-B's
+    tokio::time::sleep(Duration::from_millis(4600)).await;
+    Client::new()
+        .put(format!("{base}/waiter-race"))
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+
+    let status_a = get_a.await.unwrap();
+    assert_eq!(status_a, 404);
+
+    let (status_b, body_b) = get_b.await.unwrap();
+    assert_eq!(status_b, 200);
+    assert_eq!(body_b, "hello");
+}
+
+#[tokio::test]
 async fn duplicate_put_returns_conflict() {
     let srv = spawn_server().await;
     let base = base_url(&srv);

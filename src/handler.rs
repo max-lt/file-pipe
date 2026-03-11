@@ -447,8 +447,9 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         tokio::select! {
             _ = notified => continue,
             _ = tokio::time::sleep_until(deadline) => {
-                // Clean up our waiter on timeout
-                state.key_waiters.lock().await.remove(&key);
+                // Don't remove the waiter — other GETs may share it.
+                // The PUT will remove it when it arrives, or it stays
+                // as a tiny Arc<Notify> until then.
                 return PipeError::KeyNotFound.into_response();
             }
         }
