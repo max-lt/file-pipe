@@ -14,8 +14,16 @@ struct Args {
     data_dir: String,
 
     /// Maximum disk usage (e.g. "1G", "500M", "1024K")
-    #[arg(short, long, value_parser = parse_size)]
+    #[arg(short = 'D', long, value_parser = parse_size)]
     max_disk: Option<u64>,
+
+    /// Maximum memory usage (e.g. "256M", "1G"). When full, new data spills to disk.
+    #[arg(short = 'M', long, value_parser = parse_size)]
+    max_memory: Option<u64>,
+
+    /// Files smaller than this stay in memory (default: "1M")
+    #[arg(short, long, value_parser = parse_size, default_value = "1M")]
+    spill_threshold: u64,
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -44,11 +52,19 @@ async fn main() {
         addr: args.listen,
         data_dir: PathBuf::from(args.data_dir),
         max_disk_usage: args.max_disk,
+        max_memory: args.max_memory,
+        spill_threshold: args.spill_threshold,
     };
+
+    if let Some(max) = config.max_memory {
+        eprintln!("max memory: {}", format_size(max));
+    }
 
     if let Some(max) = config.max_disk_usage {
         eprintln!("max disk usage: {}", format_size(max));
     }
+
+    eprintln!("spill threshold: {}", format_size(config.spill_threshold));
 
     let handle = file_pipe::start_server(config).await;
     eprintln!("file-pipe listening on {}", handle.addr);

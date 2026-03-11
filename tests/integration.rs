@@ -289,6 +289,7 @@ async fn disk_quota_enforced() {
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
         max_disk_usage: Some(100),
+        spill_threshold: 0,
         ..Default::default()
     })
     .await;
@@ -315,4 +316,121 @@ async fn disk_quota_enforced() {
 
     assert_eq!(resp.status(), 503);
     assert!(resp.text().await.unwrap().contains("disk quota"));
+}
+
+#[tokio::test]
+async fn memory_limit_spills_to_disk() {
+    // max_memory=80 bytes, spill_threshold=1M (high), so small files normally stay in memory.
+    // But once global memory is full, new uploads should spill to disk instead of failing.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        max_memory: Some(80),
+        ..Default::default()
+    })
+    .await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // First PUT: 50 bytes — fits in memory
+    let resp = client
+        .put(format!("{base}/a"))
+        .body("x".repeat(50))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // Second PUT: 50 bytes — would exceed 80 byte memory limit, should spill to disk (not fail)
+    let resp = client
+        .put(format!("{base}/b"))
+        .body("y".repeat(50))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // Both should still be readable
+    let resp = client.get(format!("{base}/a")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "x".repeat(50));
+
+    let resp = client.get(format!("{base}/b")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "y".repeat(50));
+}
+
+#[tokio::test]
+async fn memory_limit_with_disk_quota() {
+    // max_memory=80, max_disk=60, spill_threshold=1M.
+    // First file (50B) fits in memory. Second file (50B) spills to disk (memory full).
+    // Third file (50B) also tries to spill but disk quota is exceeded → 503.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        max_memory: Some(80),
+        max_disk_usage: Some(60),
+        ..Default::default()
+    })
+    .await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // First: 50B in memory — OK
+    let resp = client
+        .put(format!("{base}/mem"))
+        .body("a".repeat(50))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // Second: 50B spills to disk (memory full) — OK (fits in 60B disk quota)
+    let resp = client
+        .put(format!("{base}/disk"))
+        .body("b".repeat(50))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // Third: 50B tries to spill but disk quota exceeded — 503
+    let resp = client
+        .put(format!("{base}/fail"))
+        .body("c".repeat(50))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 503);
+    assert!(resp.text().await.unwrap().contains("disk quota"));
+}
+
+#[tokio::test]
+async fn spill_threshold_forces_disk() {
+    // spill_threshold=0 means everything goes to disk immediately.
+    // Verify data is still readable.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        spill_threshold: 0,
+        ..Default::default()
+    })
+    .await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let data = "this goes straight to disk";
+
+    client
+        .put(format!("{base}/disk"))
+        .body(data)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client.get(format!("{base}/disk")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), data);
 }

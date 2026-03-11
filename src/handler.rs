@@ -49,25 +49,12 @@ async fn handle_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    // Create temp file for buffering
+    // Create temp file path (file created lazily on spill)
     let file_path = state.data_dir.join(format!(
         "pipe-{}-{}",
         std::process::id(),
         key.replace('/', "_")
     ));
-
-    let file = match std::fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&file_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            return PipeError::from_io(e).into_response();
-        }
-    };
 
     let entry = Arc::new(PipeEntry {
         meta: tokio::sync::Mutex::new(PipeMetadata {
@@ -79,7 +66,9 @@ async fn handle_put(
         }),
         written: 0.into(),
         done: false.into(),
-        file,
+        buffer: tokio::sync::Mutex::new(Vec::new()),
+        spilled: false.into(),
+        file: tokio::sync::Mutex::new(None),
         path: file_path,
         notify: tokio::sync::Notify::new(),
     });
@@ -89,8 +78,6 @@ async fn handle_put(
         let mut map = state.pipes.write().await;
 
         if map.contains_key(&key) {
-            // Clean up the file we just created
-            let _ = std::fs::remove_file(&entry.path);
             return PipeError::KeyAlreadyExists.into_response();
         }
 
@@ -102,7 +89,7 @@ async fn handle_put(
 
     eprintln!("[PUT] key={key} upload started");
 
-    // Stream the request body to disk
+    // Stream the request body
     let mut body = req.into_body();
 
     loop {
@@ -110,33 +97,9 @@ async fn handle_put(
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
                     if !data.is_empty() {
-                        let len = data.len() as u64;
-
-                        // Reserve disk quota optimistically to avoid TOCTOU
-                        if let Some(max) = state.max_disk_usage {
-                            let prev = state.disk_usage.fetch_add(len, Ordering::Relaxed);
-
-                            if prev + len > max {
-                                state.disk_usage.fetch_sub(len, Ordering::Relaxed);
-                                entry.done.store(true, Ordering::Release);
-                                entry.notify.notify_waiters();
-                                return PipeError::DiskQuotaExceeded.into_response();
-                            }
-                        } else {
-                            state.disk_usage.fetch_add(len, Ordering::Relaxed);
+                        if let Err(resp) = write_chunk(&entry, &state, &data).await {
+                            return resp;
                         }
-
-                        // Write to disk (single writer, no lock needed)
-                        if let Err(e) = (&entry.file).write_all(&data) {
-                            // Roll back the reserved quota
-                            state.disk_usage.fetch_sub(len, Ordering::Relaxed);
-                            entry.done.store(true, Ordering::Release);
-                            entry.notify.notify_waiters();
-                            return PipeError::from_io(e).into_response();
-                        }
-                        // Release ordering: readers must see the file data before the updated counter
-                        entry.written.fetch_add(len, Ordering::Release);
-                        entry.notify.notify_waiters();
                     }
                 }
             }
@@ -147,10 +110,14 @@ async fn handle_put(
             }
             None => {
                 let total_bytes = entry.written.load(Ordering::Relaxed);
+                let spilled = entry.spilled.load(Ordering::Relaxed);
                 entry.meta.lock().await.upload_ended_at = Some(Instant::now());
                 entry.done.store(true, Ordering::Release);
                 entry.notify.notify_waiters();
-                eprintln!("[PUT] key={key} upload complete: {total_bytes} bytes");
+                eprintln!(
+                    "[PUT] key={key} upload complete: {total_bytes} bytes ({})",
+                    if spilled { "disk" } else { "memory" }
+                );
                 break;
             }
         }
@@ -166,6 +133,153 @@ async fn handle_put(
     });
 
     ok_response()
+}
+
+/// Write a chunk to the pipe, handling memory → disk spill and quota.
+async fn write_chunk(
+    entry: &PipeEntry,
+    state: &AppState,
+    data: &[u8],
+) -> Result<(), Response<BoxBody>> {
+    let len = data.len() as u64;
+
+    if entry.spilled.load(Ordering::Relaxed) {
+        // Already on disk — write directly to file
+        return write_to_disk(entry, state, data).await;
+    }
+
+    let current_written = entry.written.load(Ordering::Relaxed);
+
+    if current_written + len > state.spill_threshold {
+        // Per-file threshold exceeded — spill
+        return spill_to_disk(entry, state, data).await;
+    }
+
+    // Try to reserve memory (optimistic fetch_add)
+    let prev_mem = state.memory_usage.fetch_add(len, Ordering::Relaxed);
+
+    if state.max_memory.is_some_and(|max| prev_mem + len > max) {
+        // Memory full — rollback and force-spill to disk
+        state.memory_usage.fetch_sub(len, Ordering::Relaxed);
+        return spill_to_disk(entry, state, data).await;
+    }
+
+    // Memory reserved — append to buffer
+    let mut buf = entry.buffer.lock().await;
+    buf.extend_from_slice(data);
+    drop(buf);
+    entry.written.fetch_add(len, Ordering::Release);
+    entry.notify.notify_waiters();
+    Ok(())
+}
+
+/// Spill in-memory buffer to disk and write the new chunk.
+async fn spill_to_disk(
+    entry: &PipeEntry,
+    state: &AppState,
+    new_data: &[u8],
+) -> Result<(), Response<BoxBody>> {
+    let buf = entry.buffer.lock().await;
+    let buf_len = buf.len() as u64;
+    let total_len = buf_len + new_data.len() as u64;
+
+    // Reserve disk quota for buffer + new data
+    if let Some(max) = state.max_disk_usage {
+        let prev = state.disk_usage.fetch_add(total_len, Ordering::Relaxed);
+
+        if prev + total_len > max {
+            state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
+            drop(buf);
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            return Err(PipeError::DiskQuotaExceeded.into_response());
+        }
+    } else {
+        state.disk_usage.fetch_add(total_len, Ordering::Relaxed);
+    }
+
+    // Create file and write buffer + new data
+    let file = match std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&entry.path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
+            drop(buf);
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            return Err(PipeError::from_io(e).into_response());
+        }
+    };
+
+    if let Err(e) = (&file)
+        .write_all(&buf)
+        .and_then(|()| (&file).write_all(new_data))
+    {
+        state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
+        drop(buf);
+        entry.done.store(true, Ordering::Release);
+        entry.notify.notify_waiters();
+        return Err(PipeError::from_io(e).into_response());
+    }
+
+    drop(buf);
+
+    // Buffer moved from memory to disk — release memory quota
+    state.memory_usage.fetch_sub(buf_len, Ordering::Relaxed);
+
+    *entry.file.lock().await = Some(file);
+    entry.spilled.store(true, Ordering::Release);
+    entry
+        .written
+        .fetch_add(new_data.len() as u64, Ordering::Release);
+    entry.notify.notify_waiters();
+
+    Ok(())
+}
+
+/// Write a chunk directly to disk (already spilled).
+async fn write_to_disk(
+    entry: &PipeEntry,
+    state: &AppState,
+    data: &[u8],
+) -> Result<(), Response<BoxBody>> {
+    let len = data.len() as u64;
+
+    // Reserve disk quota optimistically
+    if let Some(max) = state.max_disk_usage {
+        let prev = state.disk_usage.fetch_add(len, Ordering::Relaxed);
+
+        if prev + len > max {
+            state.disk_usage.fetch_sub(len, Ordering::Relaxed);
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            return Err(PipeError::DiskQuotaExceeded.into_response());
+        }
+    } else {
+        state.disk_usage.fetch_add(len, Ordering::Relaxed);
+    }
+
+    let file_guard = entry.file.lock().await;
+    let file = file_guard.as_ref().unwrap();
+
+    if let Err(e) = (&*file).write_all(data) {
+        drop(file_guard);
+        state.disk_usage.fetch_sub(len, Ordering::Relaxed);
+        entry.done.store(true, Ordering::Release);
+        entry.notify.notify_waiters();
+        return Err(PipeError::from_io(e).into_response());
+    }
+
+    drop(file_guard);
+    entry.written.fetch_add(len, Ordering::Release);
+    entry.notify.notify_waiters();
+
+    Ok(())
 }
 
 async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
@@ -216,41 +330,57 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         meta.content_length
     };
 
-    // Stream the response using pread (read_at) on the shared file descriptor
+    // Stream the response
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
 
     tokio::spawn(async move {
         let mut pos: u64 = 0;
 
         loop {
-            // Register interest BEFORE checking to avoid missed notifications
             let notified = entry.notify.notified();
 
-            // Load done BEFORE written: if done is true, the Acquire synchronizes
-            // with the writer's Release on done (which happens after Release on written),
-            // guaranteeing we see the final written value.
             let is_done = entry.done.load(Ordering::Acquire);
             let written = entry.written.load(Ordering::Acquire);
+            let spilled = entry.spilled.load(Ordering::Acquire);
 
-            // Read all available data from disk using pread (no seek, no lock)
-            while pos < written {
-                let to_read = std::cmp::min(READ_BUF_SIZE as u64, written - pos) as usize;
-                let mut buf = vec![0u8; to_read];
+            if pos < written {
+                if !spilled {
+                    // Read from in-memory buffer
+                    let buf = entry.buffer.lock().await;
+                    let chunk = Bytes::copy_from_slice(&buf[pos as usize..written as usize]);
+                    drop(buf);
+                    pos = written;
 
-                match entry.file.read_at(&mut buf, pos) {
-                    Ok(n) if n > 0 => {
-                        pos += n as u64;
-                        buf.truncate(n);
-
-                        if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
-                            return; // Client disconnected
-                        }
-                    }
-                    Ok(_) => break, // Short read, wait for more
-                    Err(e) => {
-                        eprintln!("[GET] read error: {e}");
+                    if tx.send(Ok(Frame::data(chunk))).await.is_err() {
                         return;
                     }
+                } else {
+                    // Read from disk using pread
+                    let file_guard = entry.file.lock().await;
+                    let file = file_guard.as_ref().unwrap();
+
+                    while pos < written {
+                        let to_read = std::cmp::min(READ_BUF_SIZE as u64, written - pos) as usize;
+                        let mut buf = vec![0u8; to_read];
+
+                        match file.read_at(&mut buf, pos) {
+                            Ok(n) if n > 0 => {
+                                pos += n as u64;
+                                buf.truncate(n);
+
+                                if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(_) => break,
+                            Err(e) => {
+                                eprintln!("[GET] read error: {e}");
+                                return;
+                            }
+                        }
+                    }
+
+                    drop(file_guard);
                 }
             }
 

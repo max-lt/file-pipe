@@ -16,6 +16,9 @@ pub struct ServerConfig {
     pub addr: String,
     pub data_dir: PathBuf,
     pub max_disk_usage: Option<u64>,
+    pub max_memory: Option<u64>,
+    /// Files smaller than this stay in memory (default: 1MB).
+    pub spill_threshold: u64,
 }
 
 impl Default for ServerConfig {
@@ -24,6 +27,8 @@ impl Default for ServerConfig {
             addr: "0.0.0.0:3000".into(),
             data_dir: std::env::temp_dir(),
             max_disk_usage: None,
+            max_memory: None,
+            spill_threshold: 1024 * 1024,
         }
     }
 }
@@ -47,12 +52,19 @@ impl ServerHandle {
         for key in &keys {
             if let Some(entry) = map.remove(key) {
                 let written = entry.written.load(Ordering::Relaxed);
-                self.state.disk_usage.fetch_sub(written, Ordering::Relaxed);
 
-                if let Err(e) = std::fs::remove_file(&entry.path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
+                if entry.spilled.load(Ordering::Relaxed) {
+                    self.state.disk_usage.fetch_sub(written, Ordering::Relaxed);
+
+                    if let Err(e) = std::fs::remove_file(&entry.path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
+                        }
                     }
+                } else {
+                    self.state
+                        .memory_usage
+                        .fetch_sub(written, Ordering::Relaxed);
                 }
 
                 eprintln!("[CLEANUP] key={key} removed ({written} bytes freed)");
@@ -71,6 +83,9 @@ pub async fn start_server(config: ServerConfig) -> ServerHandle {
         data_dir: config.data_dir,
         disk_usage: AtomicU64::new(0),
         max_disk_usage: config.max_disk_usage,
+        memory_usage: AtomicU64::new(0),
+        max_memory: config.max_memory,
+        spill_threshold: config.spill_threshold,
     });
 
     let listener = TcpListener::bind(&config.addr).await.unwrap();
