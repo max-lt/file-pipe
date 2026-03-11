@@ -826,6 +826,87 @@ async fn key_reusable_after_cleanup() {
     assert_eq!(resp.text().await.unwrap(), "second");
 }
 
+// --- Spill race: reader must not OOB access buffer during spill ---
+
+#[tokio::test]
+async fn spill_race_concurrent_readers_stress() {
+    // Stress test for the spill race: many readers streaming while the writer
+    // triggers a memory→disk spill. If the reader sees the bumped `written`
+    // but stale `spilled=false`, it would OOB-index into the in-memory buffer.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        spill_threshold: 64,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let base = Arc::new(base_url(&srv));
+
+    for iteration in 0..10 {
+        let key = format!("spill-race-{iteration}");
+        let (body_tx, body_rx) =
+            tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(1);
+        let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+        let base_put = base.clone();
+        let key_put = key.clone();
+
+        tokio::spawn(async move {
+            let _ = Client::new()
+                .put(format!("{base_put}/{key_put}"))
+                .body(reqwest::Body::wrap_stream(body_stream))
+                .send()
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Spawn several concurrent readers
+        let mut get_handles = Vec::new();
+
+        for _ in 0..5 {
+            let base_get = base.clone();
+            let key_get = key.clone();
+
+            get_handles.push(tokio::spawn(async move {
+                let resp = Client::new()
+                    .get(format!("{base_get}/{key_get}"))
+                    .send()
+                    .await
+                    .unwrap();
+
+                let mut stream = resp.bytes_stream();
+                let mut received = Vec::new();
+
+                while let Some(chunk) = stream.next().await {
+                    received.extend_from_slice(&chunk.unwrap());
+                }
+
+                received
+            }));
+        }
+
+        // Small chunk fits in memory (< 64 bytes)
+        body_tx.send(Ok(Bytes::from("A".repeat(32)))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // This chunk triggers the spill (total 96 > 64)
+        body_tx.send(Ok(Bytes::from("B".repeat(64)))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // More data after spill
+        body_tx.send(Ok(Bytes::from("C".repeat(32)))).await.unwrap();
+        drop(body_tx);
+
+        let expected = format!("{}{}{}", "A".repeat(32), "B".repeat(64), "C".repeat(32));
+
+        for handle in get_handles {
+            let received = handle.await.unwrap();
+            assert_eq!(String::from_utf8(received).unwrap(), expected);
+        }
+    }
+}
+
 // --- Multipart large file through disk spill ---
 
 #[tokio::test]

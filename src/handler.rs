@@ -356,13 +356,14 @@ async fn spill_to_disk(
     state.memory_usage.fetch_sub(buf_len, Ordering::Relaxed);
 
     *entry.file.lock().await = Some(file);
-    // Bump written BEFORE setting spilled: readers load spilled before
-    // written, so if a reader sees spilled=false it will never see a
-    // written value that exceeds the in-memory buffer length.
+    // Set spilled BEFORE bumping written: readers load written before
+    // spilled, so if a reader sees the new written value, its Acquire
+    // synchronizes with this Release, guaranteeing it also sees
+    // spilled=true and reads from disk instead of the buffer.
+    entry.spilled.store(true, Ordering::Release);
     entry
         .written
         .fetch_add(new_data.len() as u64, Ordering::Release);
-    entry.spilled.store(true, Ordering::Release);
     entry.notify.notify_waiters();
 
     Ok(())
@@ -488,12 +489,13 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
             let notified = entry.notify.notified();
 
             let is_done = entry.done.load(Ordering::Acquire);
-            // Load spilled BEFORE written: if we see spilled=false, the
-            // written value we load next cannot exceed the buffer length.
-            // The writer in spill_to_disk bumps written BEFORE setting
-            // spilled=true, so this ordering is safe.
-            let spilled = entry.spilled.load(Ordering::Acquire);
+            // Load written BEFORE spilled: if we see a written value that
+            // includes post-spill data, our Acquire synchronizes with the
+            // writer's Release on written, which happens-after the Release
+            // store of spilled=true. So we are guaranteed to see spilled=true
+            // and will read from disk, not the buffer.
             let written = entry.written.load(Ordering::Acquire);
+            let spilled = entry.spilled.load(Ordering::Acquire);
 
             if pos < written {
                 if !spilled {
