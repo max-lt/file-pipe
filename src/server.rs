@@ -73,8 +73,8 @@ impl ServerHandle {
     }
 }
 
-pub async fn start_server(config: ServerConfig) -> ServerHandle {
-    std::fs::create_dir_all(&config.data_dir).expect("failed to create data directory");
+pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle> {
+    std::fs::create_dir_all(&config.data_dir)?;
 
     let state = Arc::new(AppState {
         pipes: RwLock::new(HashMap::new()),
@@ -88,8 +88,8 @@ pub async fn start_server(config: ServerConfig) -> ServerHandle {
         spill_threshold: config.spill_threshold,
     });
 
-    let listener = TcpListener::bind(&config.addr).await.unwrap();
-    let local_addr = listener.local_addr().unwrap();
+    let listener = TcpListener::bind(&config.addr).await?;
+    let local_addr = listener.local_addr()?;
 
     let state_clone = state.clone();
 
@@ -99,6 +99,7 @@ pub async fn start_server(config: ServerConfig) -> ServerHandle {
                 Ok(conn) => conn,
                 Err(e) => {
                     eprintln!("[ERROR] accept failed: {e}");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     continue;
                 }
             };
@@ -122,8 +123,8 @@ pub async fn start_server(config: ServerConfig) -> ServerHandle {
         }
     });
 
-    ServerHandle {
+    Ok(ServerHandle {
         addr: local_addr,
         state,
-    }
+    })
 }

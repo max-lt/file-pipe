@@ -165,7 +165,14 @@ async fn stream_multipart(
     state: Arc<AppState>,
 ) -> Response<BoxBody> {
     let stream = body.into_data_stream();
-    let mut multipart = multer::Multipart::new(stream, boundary);
+    // Limit multipart header sizes to prevent abuse.
+    // Field data size is unlimited here — enforced by our own disk/memory quotas.
+    let constraints = multer::Constraints::new().size_limit(
+        multer::SizeLimit::new()
+            .whole_stream(u64::MAX)
+            .per_field(u64::MAX),
+    );
+    let mut multipart = multer::Multipart::with_constraints(stream, boundary, constraints);
 
     // Find the first field (we only support a single file per upload)
     let field = match multipart.next_field().await {

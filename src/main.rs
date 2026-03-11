@@ -66,7 +66,10 @@ async fn main() {
 
     eprintln!("spill threshold: {}", format_size(config.spill_threshold));
 
-    let handle = file_pipe::start_server(config).await;
+    let handle = file_pipe::start_server(config).await.unwrap_or_else(|e| {
+        eprintln!("failed to start server: {e}");
+        std::process::exit(1);
+    });
     eprintln!("file-pipe listening on {}", handle.addr);
 
     wait_for_signal().await;

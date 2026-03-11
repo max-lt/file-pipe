@@ -11,6 +11,7 @@ async fn spawn_server() -> file_pipe::ServerHandle {
         ..Default::default()
     })
     .await
+    .unwrap()
 }
 
 fn base_url(handle: &file_pipe::ServerHandle) -> String {
@@ -293,7 +294,8 @@ async fn disk_quota_enforced() {
         spill_threshold: 0,
         ..Default::default()
     })
-    .await;
+    .await
+    .unwrap();
     let base = base_url(&srv);
     let client = Client::new();
 
@@ -328,7 +330,8 @@ async fn memory_limit_spills_to_disk() {
         max_memory: Some(80),
         ..Default::default()
     })
-    .await;
+    .await
+    .unwrap();
     let base = base_url(&srv);
     let client = Client::new();
 
@@ -373,7 +376,8 @@ async fn memory_limit_with_disk_quota() {
         max_disk_usage: Some(60),
         ..Default::default()
     })
-    .await;
+    .await
+    .unwrap();
     let base = base_url(&srv);
     let client = Client::new();
 
@@ -418,7 +422,8 @@ async fn spill_threshold_forces_disk() {
         spill_threshold: 0,
         ..Default::default()
     })
-    .await;
+    .await
+    .unwrap();
     let base = base_url(&srv);
     let client = Client::new();
 
@@ -541,7 +546,8 @@ async fn reader_survives_spill_during_streaming() {
         spill_threshold: 64,
         ..Default::default()
     })
-    .await;
+    .await
+    .unwrap();
     let base = base_url(&srv);
     let base2 = base.clone();
 
@@ -689,7 +695,8 @@ async fn large_file_through_disk_spill() {
         spill_threshold: 1024, // 1KB threshold
         ..Default::default()
     })
-    .await;
+    .await
+    .unwrap();
     let base = base_url(&srv);
     let client = Client::new();
 
@@ -733,7 +740,8 @@ async fn writer_disconnect_mid_upload() {
             .put(format!("{base2}/disconnect"))
             .body(reqwest::Body::wrap_stream(body_stream))
             .send()
-            .await;
+            .await
+    .unwrap();
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -827,7 +835,8 @@ async fn multipart_large_file_spills_to_disk() {
         spill_threshold: 512,
         ..Default::default()
     })
-    .await;
+    .await
+    .unwrap();
     let base = base_url(&srv);
     let client = Client::new();
 
