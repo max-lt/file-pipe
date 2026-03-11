@@ -5,7 +5,11 @@ use std::time::Instant;
 use tokio::time::Duration;
 
 async fn spawn_server() -> file_pipe::ServerHandle {
-    file_pipe::start_server("127.0.0.1:0").await
+    file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        ..Default::default()
+    })
+    .await
 }
 
 fn base_url(handle: &file_pipe::ServerHandle) -> String {
@@ -278,4 +282,37 @@ async fn drain_rejects_new_puts() {
     let resp = client.get(format!("{base}/before")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "ok");
+}
+
+#[tokio::test]
+async fn disk_quota_enforced() {
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        max_disk_usage: Some(100),
+        ..Default::default()
+    })
+    .await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // First PUT: 50 bytes — should succeed
+    let resp = client
+        .put(format!("{base}/small"))
+        .body("x".repeat(50))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // Second PUT: 60 bytes — would exceed 100 byte limit
+    let resp = client
+        .put(format!("{base}/toobig"))
+        .body("y".repeat(60))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 503);
+    assert!(resp.text().await.unwrap().contains("disk quota"));
 }

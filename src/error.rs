@@ -14,6 +14,7 @@ pub enum PipeError {
     Draining,
     TooManyOpenFiles,
     DiskFull,
+    DiskQuotaExceeded,
     IoError(std::io::Error),
     UploadError(hyper::Error),
 }
@@ -33,7 +34,7 @@ impl PipeError {
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::KeyAlreadyExists => StatusCode::CONFLICT,
             Self::KeyNotFound => StatusCode::NOT_FOUND,
-            Self::Draining | Self::TooManyOpenFiles | Self::DiskFull => {
+            Self::Draining | Self::TooManyOpenFiles | Self::DiskFull | Self::DiskQuotaExceeded => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             Self::IoError(_) | Self::UploadError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -49,6 +50,7 @@ impl PipeError {
             Self::Draining => "server is shutting down, not accepting new uploads".into(),
             Self::TooManyOpenFiles => "too many open files, try again later".into(),
             Self::DiskFull => "disk full, try again later".into(),
+            Self::DiskQuotaExceeded => "disk quota exceeded, try again later".into(),
             Self::IoError(e) => format!("internal error: {e}"),
             Self::UploadError(e) => format!("upload failed: {e}"),
         }
