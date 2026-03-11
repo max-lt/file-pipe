@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::handler::handle;
 use crate::state::AppState;
@@ -56,7 +56,7 @@ impl ServerHandle {
                 if entry.spilled.load(Ordering::Relaxed) {
                     self.state.disk_usage.fetch_sub(written, Ordering::Relaxed);
 
-                    if let Err(e) = std::fs::remove_file(&entry.path) {
+                    if let Err(e) = crate::io::remove(&entry.path).await {
                         if e.kind() != std::io::ErrorKind::NotFound {
                             eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
                         }
@@ -78,7 +78,7 @@ pub async fn start_server(config: ServerConfig) -> ServerHandle {
 
     let state = Arc::new(AppState {
         pipes: RwLock::new(HashMap::new()),
-        key_added: Notify::new(),
+        key_waiters: Mutex::new(HashMap::new()),
         draining: AtomicBool::new(false),
         data_dir: config.data_dir,
         disk_usage: AtomicU64::new(0),

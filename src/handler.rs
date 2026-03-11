@@ -1,6 +1,4 @@
 use std::convert::Infallible;
-use std::io::Write as _;
-use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -91,7 +89,7 @@ async fn handle_put(
         }),
         written: 0.into(),
         done: false.into(),
-        buffer: tokio::sync::Mutex::new(Vec::new()),
+        buffer: tokio::sync::RwLock::new(Vec::new()),
         spilled: false.into(),
         file: tokio::sync::Mutex::new(None),
         path: file_path,
@@ -109,8 +107,10 @@ async fn handle_put(
         map.insert(key.clone(), entry.clone());
     }
 
-    // Notify GETs waiting for this key
-    state.key_added.notify_waiters();
+    // Notify GETs waiting for this specific key
+    if let Some(waiter) = state.key_waiters.lock().await.remove(&key) {
+        waiter.notify_waiters();
+    }
 
     eprintln!("[PUT] key={key} upload started");
 
@@ -282,7 +282,7 @@ async fn write_chunk(
     }
 
     // Memory reserved — append to buffer
-    let mut buf = entry.buffer.lock().await;
+    let mut buf = entry.buffer.write().await;
     buf.extend_from_slice(data);
     drop(buf);
     entry.written.fetch_add(len, Ordering::Release);
@@ -296,7 +296,7 @@ async fn spill_to_disk(
     state: &AppState,
     new_data: &[u8],
 ) -> Result<(), Response<BoxBody>> {
-    let buf = entry.buffer.lock().await;
+    let buf = entry.buffer.read().await;
     let buf_len = buf.len() as u64;
     let total_len = buf_len + new_data.len() as u64;
 
@@ -316,13 +316,7 @@ async fn spill_to_disk(
     }
 
     // Create file and write buffer + new data
-    let file = match std::fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&entry.path)
-    {
+    let file = match crate::io::create_rw(&entry.path).await {
         Ok(f) => f,
         Err(e) => {
             state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
@@ -333,10 +327,15 @@ async fn spill_to_disk(
         }
     };
 
-    if let Err(e) = (&file)
-        .write_all(&buf)
-        .and_then(|()| (&file).write_all(new_data))
-    {
+    if let Err(e) = crate::io::write_at(&file, &buf, 0).await {
+        state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
+        drop(buf);
+        entry.done.store(true, Ordering::Release);
+        entry.notify.notify_waiters();
+        return Err(PipeError::from_io(e).into_response());
+    }
+
+    if let Err(e) = crate::io::write_at(&file, new_data, buf_len).await {
         state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
         drop(buf);
         entry.done.store(true, Ordering::Release);
@@ -386,8 +385,9 @@ async fn write_to_disk(
 
     let file_guard = entry.file.lock().await;
     let file = file_guard.as_ref().unwrap();
+    let offset = entry.written.load(Ordering::Relaxed);
 
-    if let Err(e) = (&*file).write_all(data) {
+    if let Err(e) = crate::io::write_at(file, data, offset).await {
         drop(file_guard);
         state.disk_usage.fetch_sub(len, Ordering::Relaxed);
         entry.done.store(true, Ordering::Release);
@@ -407,8 +407,27 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
 
     // Wait for the key to appear (up to 5s)
     let entry = loop {
-        let notified = state.key_added.notified();
+        // Check if the key already exists
+        {
+            let map = state.pipes.read().await;
 
+            if let Some(entry) = map.get(&key) {
+                break entry.clone();
+            }
+        }
+
+        // Register a per-key waiter so only the matching PUT wakes us
+        let waiter = {
+            let mut waiters = state.key_waiters.lock().await;
+            waiters
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+                .clone()
+        };
+
+        let notified = waiter.notified();
+
+        // Re-check after registering (the PUT may have arrived between our check and register)
         {
             let map = state.pipes.read().await;
 
@@ -420,6 +439,8 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         tokio::select! {
             _ = notified => continue,
             _ = tokio::time::sleep_until(deadline) => {
+                // Clean up our waiter on timeout
+                state.key_waiters.lock().await.remove(&key);
                 return PipeError::KeyNotFound.into_response();
             }
         }
@@ -469,8 +490,8 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
 
             if pos < written {
                 if !spilled {
-                    // Read from in-memory buffer
-                    let buf = entry.buffer.lock().await;
+                    // Read from in-memory buffer (read lock — multiple readers OK)
+                    let buf = entry.buffer.read().await;
                     let chunk = Bytes::copy_from_slice(&buf[pos as usize..written as usize]);
                     drop(buf);
                     pos = written;
@@ -479,18 +500,19 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
                         return;
                     }
                 } else {
-                    // Read from disk using pread
+                    // Read from disk using pread — clone handle once, release lock
                     let file_guard = entry.file.lock().await;
-                    let file = file_guard.as_ref().unwrap();
+                    let file = file_guard.as_ref().unwrap()
+                        .try_clone()
+                        .expect("failed to clone file handle");
+                    drop(file_guard);
 
                     while pos < written {
                         let to_read = std::cmp::min(READ_BUF_SIZE as u64, written - pos) as usize;
-                        let mut buf = vec![0u8; to_read];
 
-                        match file.read_at(&mut buf, pos) {
-                            Ok(n) if n > 0 => {
-                                pos += n as u64;
-                                buf.truncate(n);
+                        match crate::io::read_at(&file, pos, to_read).await {
+                            Ok(buf) if !buf.is_empty() => {
+                                pos += buf.len() as u64;
 
                                 if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
                                     return;
@@ -503,8 +525,6 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
                             }
                         }
                     }
-
-                    drop(file_guard);
                 }
             }
 

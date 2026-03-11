@@ -25,7 +25,8 @@ pub struct PipeEntry {
     pub done: AtomicBool,
     /// In-memory buffer for small files. Once spilled, no longer appended to
     /// but kept alive so in-flight readers can finish reading from it.
-    pub buffer: Mutex<Vec<u8>>,
+    /// RwLock so multiple readers can read concurrently.
+    pub buffer: RwLock<Vec<u8>>,
     /// Set to true once data has been spilled to disk.
     pub spilled: AtomicBool,
     /// File handle and path — only valid after spill.
@@ -36,7 +37,9 @@ pub struct PipeEntry {
 
 pub struct AppState {
     pub pipes: RwLock<HashMap<String, Arc<PipeEntry>>>,
-    pub key_added: Notify,
+    /// Per-key waiters: GETs register here when their key doesn't exist yet.
+    /// The PUT for that key notifies only the relevant waiters.
+    pub key_waiters: Mutex<HashMap<String, Arc<Notify>>>,
     pub draining: AtomicBool,
     pub data_dir: PathBuf,
     pub disk_usage: AtomicU64,
@@ -55,7 +58,7 @@ pub async fn cleanup_key(state: &AppState, key: &str) {
         if entry.spilled.load(Ordering::Relaxed) {
             state.disk_usage.fetch_sub(written, Ordering::Relaxed);
 
-            if let Err(e) = std::fs::remove_file(&entry.path) {
+            if let Err(e) = crate::io::remove(&entry.path).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
                 }
