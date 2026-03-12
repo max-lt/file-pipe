@@ -106,6 +106,9 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
                 });
 
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(std::time::Duration::from_secs(10))
+                    .keep_alive(false)
                     .serve_connection(io, service)
                     .await
                 {
