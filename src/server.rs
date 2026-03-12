@@ -1,13 +1,12 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use dashmap::DashMap;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock};
 
 use crate::handler::handle;
 use crate::state::AppState;
@@ -46,11 +45,15 @@ impl ServerHandle {
 
     /// Remove all temp files for active pipes.
     pub async fn cleanup(&self) {
-        let mut map = self.state.pipes.write().await;
-        let keys: Vec<String> = map.keys().cloned().collect();
+        let keys: Vec<String> = self
+            .state
+            .pipes
+            .iter()
+            .map(|r| r.key().clone())
+            .collect();
 
         for key in &keys {
-            if let Some(entry) = map.remove(key) {
+            if let Some((_, entry)) = self.state.pipes.remove(key) {
                 let written = entry.written.load(Ordering::Relaxed);
 
                 if entry.spilled.load(Ordering::Relaxed) {
@@ -77,8 +80,8 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
     std::fs::create_dir_all(&config.data_dir)?;
 
     let state = Arc::new(AppState {
-        pipes: RwLock::new(HashMap::new()),
-        key_waiters: Mutex::new(HashMap::new()),
+        pipes: DashMap::new(),
+        key_waiters: DashMap::new(),
         draining: AtomicBool::new(false),
         data_dir: config.data_dir,
         disk_usage: AtomicU64::new(0),

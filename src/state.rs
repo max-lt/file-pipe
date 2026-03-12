@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use dashmap::DashMap;
 use tokio::sync::{Mutex, Notify, RwLock};
 
 /// Metadata behind a mutex — only accessed for first GET, not on the hot path.
@@ -36,10 +36,10 @@ pub struct PipeEntry {
 }
 
 pub struct AppState {
-    pub pipes: RwLock<HashMap<String, Arc<PipeEntry>>>,
+    pub pipes: DashMap<String, Arc<PipeEntry>>,
     /// Per-key waiters: GETs register here when their key doesn't exist yet.
     /// The PUT for that key notifies only the relevant waiters.
-    pub key_waiters: Mutex<HashMap<String, Arc<Notify>>>,
+    pub key_waiters: DashMap<String, Arc<Notify>>,
     pub draining: AtomicBool,
     pub data_dir: PathBuf,
     pub disk_usage: AtomicU64,
@@ -50,7 +50,7 @@ pub struct AppState {
 }
 
 pub async fn cleanup_key(state: &AppState, key: &str) {
-    let entry = state.pipes.write().await.remove(key);
+    let entry = state.pipes.remove(key).map(|(_, v)| v);
 
     if let Some(entry) = entry {
         let written = entry.written.load(Ordering::Relaxed);

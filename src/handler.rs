@@ -106,19 +106,16 @@ async fn handle_put(
         notify: tokio::sync::Notify::new(),
     });
 
-    // Check-and-insert under a single write lock to avoid TOCTOU race
-    {
-        let mut map = state.pipes.write().await;
-
-        if map.contains_key(&key) {
-            return PipeError::KeyAlreadyExists.into_response();
+    // Atomic check-and-insert via DashMap entry API
+    match state.pipes.entry(key.clone()) {
+        dashmap::Entry::Occupied(_) => return PipeError::KeyAlreadyExists.into_response(),
+        dashmap::Entry::Vacant(e) => {
+            e.insert(entry.clone());
         }
-
-        map.insert(key.clone(), entry.clone());
     }
 
     // Notify GETs waiting for this specific key
-    if let Some(waiter) = state.key_waiters.lock().await.remove(&key) {
+    if let Some((_, waiter)) = state.key_waiters.remove(&key) {
         waiter.notify_waiters();
     }
 
@@ -444,41 +441,27 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
 
     // Wait for the key to appear (up to 5s)
     let entry = loop {
-        // Check if the key already exists
-        {
-            let map = state.pipes.read().await;
-
-            if let Some(entry) = map.get(&key) {
-                break entry.clone();
-            }
+        if let Some(entry) = state.pipes.get(&key) {
+            break entry.clone();
         }
 
         // Register a per-key waiter so only the matching PUT wakes us
-        let waiter = {
-            let mut waiters = state.key_waiters.lock().await;
-            waiters
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
-                .clone()
-        };
+        let waiter = state
+            .key_waiters
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone();
 
         let notified = waiter.notified();
 
         // Re-check after registering (the PUT may have arrived between our check and register)
-        {
-            let map = state.pipes.read().await;
-
-            if let Some(entry) = map.get(&key) {
-                break entry.clone();
-            }
+        if let Some(entry) = state.pipes.get(&key) {
+            break entry.clone();
         }
 
         tokio::select! {
             _ = notified => continue,
             _ = tokio::time::sleep_until(deadline) => {
-                // Don't remove the waiter — other GETs may share it.
-                // The PUT will remove it when it arrives, or it stays
-                // as a tiny Arc<Notify> until then.
                 return PipeError::KeyNotFound.into_response();
             }
         }
