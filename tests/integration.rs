@@ -754,6 +754,113 @@ async fn reader_survives_spill_during_streaming() {
     assert_eq!(String::from_utf8(received).unwrap(), expected);
 }
 
+// --- Second GET after spill must read complete data from disk ---
+
+#[tokio::test]
+async fn second_reader_after_spill_gets_full_data() {
+    // GET1 connects while data is in memory. The stream spills to disk.
+    // GET2 connects after the spill. Both must receive all the data.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        spill_threshold: 64,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let base = base_url(&srv);
+    let base_get1 = base.clone();
+    let base_get2 = base.clone();
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+    let base_put = base.clone();
+
+    let put_handle = tokio::spawn(async move {
+        Client::new()
+            .put(format!("{base_put}/spill-two-readers"))
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // GET1 connects while still in memory
+    let get1_handle = tokio::spawn(async move {
+        let resp = Client::new()
+            .get(format!("{base_get1}/spill-two-readers"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+
+        let mut stream = resp.bytes_stream();
+        let mut received = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+
+        received
+    });
+
+    // Send data that fits in memory (< 64 bytes)
+    body_tx.send(Ok(Bytes::from("A".repeat(30)))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // This chunk triggers the spill (total 90 > 64)
+    body_tx.send(Ok(Bytes::from("B".repeat(60)))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // GET2 connects AFTER the spill — must read everything from disk
+    let get2_handle = tokio::spawn(async move {
+        let resp = Client::new()
+            .get(format!("{base_get2}/spill-two-readers"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+
+        let mut stream = resp.bytes_stream();
+        let mut received = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+
+        received
+    });
+
+    // More data after spill
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    body_tx.send(Ok(Bytes::from("C".repeat(40)))).await.unwrap();
+    drop(body_tx);
+
+    put_handle.await.unwrap();
+
+    let expected = format!("{}{}{}", "A".repeat(30), "B".repeat(60), "C".repeat(40));
+
+    let received1 = get1_handle.await.unwrap();
+    assert_eq!(
+        received1.len(),
+        expected.len(),
+        "GET1 (started before spill) got wrong length"
+    );
+    assert_eq!(String::from_utf8(received1).unwrap(), expected);
+
+    let received2 = get2_handle.await.unwrap();
+    assert_eq!(
+        received2.len(),
+        expected.len(),
+        "GET2 (started after spill) got wrong length"
+    );
+    assert_eq!(String::from_utf8(received2).unwrap(), expected);
+}
+
 // --- Concurrent readers during live streaming ---
 
 #[tokio::test]
