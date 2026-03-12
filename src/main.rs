@@ -40,8 +40,8 @@ fn parse_size(s: &str) -> Result<u64, String> {
 
     num.trim()
         .parse::<u64>()
-        .map(|n| n * mult)
         .map_err(|e| format!("invalid size: {e}"))
+        .and_then(|n| n.checked_mul(mult).ok_or_else(|| format!("size too large: {s}")))
 }
 
 #[tokio::main]
