@@ -68,6 +68,24 @@ impl ServerHandle {
 pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle> {
     std::fs::create_dir_all(&config.data_dir)?;
 
+    // Clean up orphaned temp files from a prior crash
+    if let Ok(entries) = std::fs::read_dir(&config.data_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("pipe-"))
+            {
+                let path = entry.path();
+                eprintln!("[STARTUP] removing orphaned file: {}", path.display());
+
+                if let Err(e) = std::fs::remove_file(&path) {
+                    eprintln!("[STARTUP] failed to remove {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
     let state = Arc::new(AppState {
         pipes: DashMap::new(),
         key_waiters: DashMap::new(),
