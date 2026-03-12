@@ -464,6 +464,16 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         tokio::select! {
             _ = notified => continue,
             _ = tokio::time::sleep_until(deadline) => {
+                // Clean up the waiter if we're the last one holding it.
+                // The DashMap shard lock ensures no one can clone the Arc
+                // between our strong_count check and the remove.
+                if let dashmap::Entry::Occupied(e) = state.key_waiters.entry(key) {
+                    if Arc::strong_count(e.get()) == 2 {
+                        // 2 refs: the map entry + our local `waiter` clone
+                        e.remove();
+                    }
+                }
+
                 return PipeError::KeyNotFound.into_response();
             }
         }

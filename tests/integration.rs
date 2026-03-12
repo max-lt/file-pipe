@@ -962,6 +962,50 @@ async fn key_reusable_after_cleanup() {
     assert_eq!(resp.text().await.unwrap(), "second");
 }
 
+// --- key_waiters must be cleaned up after GET timeout ---
+
+#[tokio::test]
+async fn key_waiters_cleaned_up_after_timeout() {
+    // Regression test: GETs to non-existent keys create key_waiters entries.
+    // After all GETs timeout, the entries must be cleaned up (not leak).
+    let srv = spawn_server().await;
+    let base = Arc::new(base_url(&srv));
+
+    assert_eq!(srv.key_waiters_count(), 0);
+
+    // Send 50 GETs to unique non-existent keys (all will timeout after 5s)
+    let mut handles = Vec::new();
+
+    for i in 0..50 {
+        let base = base.clone();
+
+        handles.push(tokio::spawn(async move {
+            let resp = Client::new()
+                .get(format!("{base}/ghost-{i}"))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), 404);
+        }));
+    }
+
+    // While GETs are waiting, key_waiters should be populated
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(srv.key_waiters_count() > 0);
+
+    // Wait for all GETs to timeout
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    // Give a moment for cleanup
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // key_waiters should be empty now
+    assert_eq!(srv.key_waiters_count(), 0);
+}
+
 // --- First-GET cleanup must not fire while upload is still in progress ---
 
 #[tokio::test]

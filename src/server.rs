@@ -38,6 +38,11 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// Number of pending key waiters (GETs waiting for a non-existent key).
+    pub fn key_waiters_count(&self) -> usize {
+        self.state.key_waiters.len()
+    }
+
     /// Start draining: reject new PUTs with 503, but let existing transfers finish.
     pub fn drain(&self) {
         self.state.draining.store(true, Ordering::Release);
