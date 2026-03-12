@@ -1043,6 +1043,437 @@ async fn spill_race_concurrent_readers_stress() {
     }
 }
 
+// --- Key length limit ---
+
+#[tokio::test]
+async fn key_too_long_returns_400() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let long_key = "x".repeat(513);
+
+    let resp = client
+        .put(format!("{base}/{long_key}"))
+        .body("data")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("512"));
+
+    // 512 bytes should be fine
+    let ok_key = "y".repeat(512);
+
+    let resp = client
+        .put(format!("{base}/{ok_key}"))
+        .body("data")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+}
+
+// --- Concurrent PUT race on same key ---
+
+#[tokio::test]
+async fn concurrent_put_same_key_one_wins() {
+    let srv = spawn_server().await;
+    let base = Arc::new(base_url(&srv));
+
+    let mut handles = Vec::new();
+
+    for i in 0..10 {
+        let base = base.clone();
+
+        handles.push(tokio::spawn(async move {
+            Client::new()
+                .put(format!("{base}/race-key"))
+                .body(format!("writer-{i}"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+
+    let mut ok_count = 0;
+    let mut conflict_count = 0;
+
+    for handle in handles {
+        match handle.await.unwrap().as_u16() {
+            200 => ok_count += 1,
+            409 => conflict_count += 1,
+            other => panic!("unexpected status: {other}"),
+        }
+    }
+
+    // Exactly one writer should win
+    assert_eq!(ok_count, 1);
+    assert_eq!(conflict_count, 9);
+}
+
+// --- Empty body PUT ---
+
+#[tokio::test]
+async fn put_empty_body() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let resp = client
+        .put(format!("{base}/empty"))
+        .body("")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let resp = client.get(format!("{base}/empty")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "");
+}
+
+// --- Keys with special characters ---
+
+#[tokio::test]
+async fn key_with_unicode_and_special_chars() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // Keys with various special characters
+    let keys = vec![
+        "hello%20world",
+        "path/with/slashes",
+        "dots...lots",
+        "key-with-dashes_and_underscores",
+    ];
+
+    for (i, key) in keys.iter().enumerate() {
+        let data = format!("data-{i}");
+
+        client
+            .put(format!("{base}/{key}"))
+            .body(data.clone())
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client.get(format!("{base}/{key}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), data);
+    }
+}
+
+// --- Disk quota hit during streaming upload ---
+
+#[tokio::test]
+async fn disk_quota_exceeded_during_streaming() {
+    // Quota is 200 bytes. Stream chunks that eventually exceed the limit.
+    // The reader should receive whatever was written before the quota hit.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        spill_threshold: 0,
+        max_disk_usage: Some(200),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let base = base_url(&srv);
+    let base2 = base.clone();
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+    let put_handle = tokio::spawn(async move {
+        Client::new()
+            .put(format!("{base2}/quota-stream"))
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let get_handle = tokio::spawn(async move {
+        let resp = Client::new()
+            .get(format!("{base}/quota-stream"))
+            .send()
+            .await
+            .unwrap();
+
+        let mut stream = resp.bytes_stream();
+        let mut received = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(data) => received.extend_from_slice(&data),
+                Err(_) => break,
+            }
+        }
+
+        received
+    });
+
+    // First chunks fit in quota
+    body_tx
+        .send(Ok(Bytes::from("A".repeat(100))))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // This chunk should exceed the 200 byte quota
+    body_tx
+        .send(Ok(Bytes::from("B".repeat(150))))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    drop(body_tx);
+
+    let put_status = put_handle.await.unwrap();
+    assert_eq!(put_status, 503);
+
+    let received = get_handle.await.unwrap();
+    // Reader should have received at least the first chunk
+    assert!(received.len() >= 100);
+}
+
+// --- Reader disconnects mid-stream ---
+
+#[tokio::test]
+async fn reader_disconnect_doesnt_break_upload() {
+    // A reader disconnecting mid-stream must not affect the upload.
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let base2 = base.clone();
+    let base3 = base.clone();
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+    let put_handle = tokio::spawn(async move {
+        Client::new()
+            .put(format!("{base2}/reader-dc"))
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // First reader connects and reads one chunk then disconnects
+    {
+        let resp = Client::new()
+            .get(format!("{base}/reader-dc"))
+            .send()
+            .await
+            .unwrap();
+
+        let mut stream = resp.bytes_stream();
+
+        body_tx
+            .send(Ok(Bytes::from("chunk1")))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Read one chunk then drop the stream (disconnect)
+        let _chunk = stream.next().await;
+    }
+
+    // Continue uploading — should not fail
+    body_tx
+        .send(Ok(Bytes::from("chunk2")))
+        .await
+        .unwrap();
+    body_tx
+        .send(Ok(Bytes::from("chunk3")))
+        .await
+        .unwrap();
+    drop(body_tx);
+
+    let put_status = put_handle.await.unwrap();
+    assert_eq!(put_status, 200);
+
+    // Second reader should get all the data
+    let resp = Client::new()
+        .get(format!("{base3}/reader-dc"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "chunk1chunk2chunk3");
+}
+
+// --- Concurrent PUTs to different keys ---
+
+#[tokio::test]
+async fn many_concurrent_puts_no_interference() {
+    let srv = spawn_server().await;
+    let base = Arc::new(base_url(&srv));
+
+    let mut put_handles = Vec::new();
+
+    for i in 0..20 {
+        let base = base.clone();
+
+        put_handles.push(tokio::spawn(async move {
+            let data: Vec<u8> = (0..1000).map(|j| ((i * 7 + j) % 256) as u8).collect();
+
+            Client::new()
+                .put(format!("{base}/concurrent-{i}"))
+                .body(data)
+                .send()
+                .await
+                .unwrap();
+
+            i
+        }));
+    }
+
+    for handle in put_handles {
+        handle.await.unwrap();
+    }
+
+    // Verify all keys have correct data
+    let mut get_handles = Vec::new();
+
+    for i in 0..20u32 {
+        let base = base.clone();
+
+        get_handles.push(tokio::spawn(async move {
+            let resp = Client::new()
+                .get(format!("{base}/concurrent-{i}"))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), 200);
+            let received = resp.bytes().await.unwrap();
+            let expected: Vec<u8> = (0..1000).map(|j| ((i * 7 + j) % 256) as u8).collect();
+            assert_eq!(received.as_ref(), expected.as_slice(), "key concurrent-{i} mismatch");
+        }));
+    }
+
+    for handle in get_handles {
+        handle.await.unwrap();
+    }
+}
+
+// --- Empty multipart ---
+
+#[tokio::test]
+async fn empty_multipart_returns_400() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // Craft a multipart body with no fields
+    let boundary = "----emptyboundary";
+    let body = b"------emptyboundary--\r\n";
+
+    let resp = client
+        .put(format!("{base}/empty-mp"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("no fields"));
+}
+
+// --- HEAD and DELETE return 405 ---
+
+#[tokio::test]
+async fn unsupported_methods_return_405() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let resp = client
+        .delete(format!("{base}/test"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 405);
+
+    let resp = client
+        .patch(format!("{base}/test"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 405);
+}
+
+// --- Binary data integrity ---
+
+#[tokio::test]
+async fn binary_data_integrity_all_byte_values() {
+    // Ensure all 256 byte values survive the roundtrip without corruption.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        spill_threshold: 0, // force disk path
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let data: Vec<u8> = (0..=255).collect();
+    let expected = data.clone();
+
+    client
+        .put(format!("{base}/binary"))
+        .body(data)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client.get(format!("{base}/binary")).send().await.unwrap();
+    let received = resp.bytes().await.unwrap();
+    assert_eq!(received.as_ref(), expected.as_slice());
+
+    // Also test memory path
+    let srv2 = spawn_server().await;
+    let base2 = base_url(&srv2);
+
+    let data: Vec<u8> = (0..=255).collect();
+
+    client
+        .put(format!("{base2}/binary-mem"))
+        .body(data.clone())
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .get(format!("{base2}/binary-mem"))
+        .send()
+        .await
+        .unwrap();
+
+    let received = resp.bytes().await.unwrap();
+    assert_eq!(received.as_ref(), data.as_slice());
+}
+
 // --- Multipart large file through disk spill ---
 
 #[tokio::test]
