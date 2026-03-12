@@ -49,24 +49,33 @@ pub struct AppState {
     pub spill_threshold: u64,
 }
 
-pub async fn cleanup_key(state: &AppState, key: &str) {
-    let entry = state.pipes.remove(key).map(|(_, v)| v);
+/// Remove a key's entry only if it is the exact same Arc (pointer equality).
+/// This prevents stale cleanup timers from deleting a recycled key's new entry.
+pub async fn cleanup_entry(state: &AppState, key: &str, expected: &Arc<PipeEntry>) {
+    let removed = match state.pipes.entry(key.to_string()) {
+        dashmap::Entry::Occupied(e) if Arc::ptr_eq(e.get(), expected) => Some(e.remove()),
+        _ => None,
+    };
 
-    if let Some(entry) = entry {
-        let written = entry.written.load(Ordering::Relaxed);
-
-        if entry.spilled.load(Ordering::Relaxed) {
-            state.disk_usage.fetch_sub(written, Ordering::Relaxed);
-
-            if let Err(e) = crate::io::remove(&entry.path).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
-                }
-            }
-        } else {
-            state.memory_usage.fetch_sub(written, Ordering::Relaxed);
-        }
-
-        eprintln!("[CLEANUP] key={key} removed ({written} bytes freed)");
+    if let Some(entry) = removed {
+        free_entry(state, key, &entry).await;
     }
+}
+
+pub(crate) async fn free_entry(state: &AppState, key: &str, entry: &PipeEntry) {
+    let written = entry.written.load(Ordering::Relaxed);
+
+    if entry.spilled.load(Ordering::Relaxed) {
+        state.disk_usage.fetch_sub(written, Ordering::Relaxed);
+
+        if let Err(e) = crate::io::remove(&entry.path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
+            }
+        }
+    } else {
+        state.memory_usage.fetch_sub(written, Ordering::Relaxed);
+    }
+
+    eprintln!("[CLEANUP] key={key} removed ({written} bytes freed)");
 }

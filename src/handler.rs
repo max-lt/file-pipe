@@ -11,7 +11,7 @@ use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{BoxBody, PipeError, ok_response};
-use crate::state::{AppState, PipeEntry, PipeMetadata, cleanup_key};
+use crate::state::{AppState, PipeEntry, PipeMetadata, cleanup_entry};
 
 /// Extract the multipart boundary from Content-Type, if present.
 fn multipart_boundary(req: &Request<Incoming>) -> Option<String> {
@@ -142,14 +142,14 @@ async fn stream_raw(
                     if !data.is_empty() {
                         if let Err(resp) = write_chunk(&entry, &state, &data).await {
                             // done already set inside write_chunk
-                            schedule_cleanup(key, state);
+                            schedule_cleanup(key, state, entry);
                             return resp;
                         }
                     }
                 }
             }
             Some(Err(e)) => {
-                fail_upload(key, &entry, state);
+                fail_upload(key, entry, state);
                 return PipeError::UploadError(e).into_response();
             }
             None => {
@@ -159,7 +159,7 @@ async fn stream_raw(
         }
     }
 
-    schedule_cleanup(key, state);
+    schedule_cleanup(key, state, entry);
     ok_response()
 }
 
@@ -180,11 +180,11 @@ async fn stream_multipart(
     let field = match multipart.next_field().await {
         Ok(Some(f)) => f,
         Ok(None) => {
-            fail_upload(key, &entry, state);
+            fail_upload(key, entry, state);
             return PipeError::EmptyMultipart.into_response();
         }
         Err(e) => {
-            fail_upload(key, &entry, state);
+            fail_upload(key, entry, state);
             return PipeError::MultipartError(e).into_response();
         }
     };
@@ -215,7 +215,7 @@ async fn stream_multipart(
                 if !data.is_empty() {
                     if let Err(resp) = write_chunk(&entry, &state, &data).await {
                         // done already set inside write_chunk
-                        schedule_cleanup(key, state);
+                        schedule_cleanup(key, state, entry);
                         return resp;
                     }
                 }
@@ -225,13 +225,13 @@ async fn stream_multipart(
                 break;
             }
             Err(e) => {
-                fail_upload(key, &entry, state);
+                fail_upload(key, entry, state);
                 return PipeError::MultipartError(e).into_response();
             }
         }
     }
 
-    schedule_cleanup(key, state);
+    schedule_cleanup(key, state, entry);
     ok_response()
 }
 
@@ -247,18 +247,18 @@ async fn finalize_upload(key: &str, entry: &PipeEntry) {
     );
 }
 
-fn schedule_cleanup(key: String, state: Arc<AppState>) {
+fn schedule_cleanup(key: String, state: Arc<AppState>, entry: Arc<PipeEntry>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        cleanup_key(&state, &key).await;
+        cleanup_entry(&state, &key, &entry).await;
     });
 }
 
 /// Mark upload as failed and schedule cleanup so the entry doesn't leak.
-fn fail_upload(key: String, entry: &PipeEntry, state: Arc<AppState>) {
+fn fail_upload(key: String, entry: Arc<PipeEntry>, state: Arc<AppState>) {
     entry.done.store(true, Ordering::Release);
     entry.notify.notify_waiters();
-    schedule_cleanup(key, state);
+    schedule_cleanup(key, state, entry);
 }
 
 /// Write a chunk to the pipe, handling memory → disk spill and quota.
@@ -339,6 +339,7 @@ async fn spill_to_disk(
     let file = match crate::io::write_at(file, &buf, 0).await {
         Ok(f) => f,
         Err(e) => {
+            let _ = crate::io::remove(&entry.path).await;
             state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
             drop(buf);
             entry.done.store(true, Ordering::Release);
@@ -350,6 +351,7 @@ async fn spill_to_disk(
     let file = match crate::io::write_at(file, new_data, buf_len).await {
         Ok(f) => f,
         Err(e) => {
+            let _ = crate::io::remove(&entry.path).await;
             state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
             drop(buf);
             entry.done.store(true, Ordering::Release);
@@ -476,13 +478,30 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         if meta.first_get_at.is_none() {
             meta.first_get_at = Some(now);
 
-            // Schedule cleanup 5s after first GET
+            // Schedule cleanup 5s after upload finishes (or immediately if already done).
+            // We must wait for the upload to complete before removing the entry.
             let state_clone = state.clone();
             let key_clone = key.clone();
+            let entry_clone = entry.clone();
 
             tokio::spawn(async move {
+                // Wait for the upload to finish first
+                loop {
+                    if entry_clone.done.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let notified = entry_clone.notify.notified();
+
+                    if entry_clone.done.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    notified.await;
+                }
+
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                cleanup_key(&state_clone, &key_clone).await;
+                cleanup_entry(&state_clone, &key_clone, &entry_clone).await;
             });
         }
 
@@ -583,7 +602,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
             .chars()
             .filter(|c| !c.is_control())
             .collect();
-        let safe = safe.replace('"', "\\\"");
+        let safe = safe.replace('\\', "\\\\").replace('"', "\\\"");
 
         response = response.header(
             hyper::header::CONTENT_DISPOSITION,

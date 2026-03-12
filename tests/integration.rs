@@ -962,6 +962,146 @@ async fn key_reusable_after_cleanup() {
     assert_eq!(resp.text().await.unwrap(), "second");
 }
 
+// --- First-GET cleanup must not fire while upload is still in progress ---
+
+#[tokio::test]
+async fn get_cleanup_waits_for_upload_to_finish() {
+    // Regression test: the 5s first-GET cleanup timer must NOT remove the
+    // entry while the writer is still uploading. A slow upload that outlasts
+    // the 5s window must survive.
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let base2 = base.clone();
+    let base3 = base.clone();
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+    // Start a slow streaming PUT
+    let put_handle = tokio::spawn(async move {
+        Client::new()
+            .put(format!("{base2}/slow-upload"))
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send first chunk
+    body_tx.send(Ok(Bytes::from("chunk1-"))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // GET while upload is in progress — triggers 5s cleanup timer
+    let get_handle = tokio::spawn(async move {
+        let resp = Client::new()
+            .get(format!("{base}/slow-upload"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+
+        let mut stream = resp.bytes_stream();
+        let mut received = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+
+        received
+    });
+
+    // Wait for the 5s cleanup timer to fire (+ margin)
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // Continue uploading AFTER the timer would have fired
+    body_tx.send(Ok(Bytes::from("chunk2-"))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    body_tx.send(Ok(Bytes::from("chunk3"))).await.unwrap();
+    drop(body_tx);
+
+    let put_status = put_handle.await.unwrap();
+    assert_eq!(put_status, 200);
+
+    let received = get_handle.await.unwrap();
+    assert_eq!(
+        String::from_utf8(received).unwrap(),
+        "chunk1-chunk2-chunk3"
+    );
+
+    // A second GET after upload completed should also work
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = Client::new()
+        .get(format!("{base3}/slow-upload"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "chunk1-chunk2-chunk3");
+}
+
+// --- Double cleanup: stale timer must not delete recycled key ---
+
+#[tokio::test]
+async fn stale_cleanup_timer_does_not_delete_recycled_key() {
+    // Regression test: PUT1 schedules a 30s cleanup. GET triggers a 5s cleanup
+    // that removes the entry first. PUT2 recycles the key. The stale 30s timer
+    // from PUT1 must NOT remove PUT2's entry.
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // PUT1: upload "first"
+    let resp = client
+        .put(format!("{base}/recycle-safe"))
+        .body("first")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // GET1: triggers 5s first-GET cleanup timer
+    let resp = client
+        .get(format!("{base}/recycle-safe"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.text().await.unwrap(), "first");
+
+    // Wait for 5s cleanup to fire (key removed)
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // PUT2: recycle the key with new data
+    let resp = client
+        .put(format!("{base}/recycle-safe"))
+        .body("second")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // Wait for PUT1's stale 30s timer to fire (30s from test start)
+    tokio::time::sleep(Duration::from_secs(25)).await;
+
+    // GET2: should still return PUT2's data (stale timer must be a no-op)
+    let resp = client
+        .get(format!("{base}/recycle-safe"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "second");
+}
+
 // --- Spill race: reader must not OOB access buffer during spill ---
 
 #[tokio::test]

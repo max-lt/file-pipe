@@ -54,23 +54,7 @@ impl ServerHandle {
 
         for key in &keys {
             if let Some((_, entry)) = self.state.pipes.remove(key) {
-                let written = entry.written.load(Ordering::Relaxed);
-
-                if entry.spilled.load(Ordering::Relaxed) {
-                    self.state.disk_usage.fetch_sub(written, Ordering::Relaxed);
-
-                    if let Err(e) = crate::io::remove(&entry.path).await {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
-                        }
-                    }
-                } else {
-                    self.state
-                        .memory_usage
-                        .fetch_sub(written, Ordering::Relaxed);
-                }
-
-                eprintln!("[CLEANUP] key={key} removed ({written} bytes freed)");
+                crate::state::free_entry(&self.state, key, &entry).await;
             }
         }
     }
