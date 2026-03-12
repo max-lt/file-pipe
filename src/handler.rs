@@ -87,7 +87,6 @@ async fn handle_put(
             content_length,
             mime_type: raw_content_type,
             filename: None,
-            reader_count: 0,
             upload_ended_at: None,
             first_get_at: None,
             last_get_at: None,
@@ -477,7 +476,6 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
     // Update metadata (behind mutex, but only once per GET — not on hot path)
     let (content_length, mime_type, filename) = {
         let mut meta = entry.meta.lock().await;
-        meta.reader_count += 1;
         let now = Instant::now();
 
         if meta.first_get_at.is_none() {
@@ -511,8 +509,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         }
 
         meta.last_get_at = Some(now);
-        let reader_num = meta.reader_count;
-        eprintln!("[GET] key={key} reader #{reader_num}");
+        eprintln!("[GET] key={key}");
         (meta.content_length, meta.mime_type.clone(), meta.filename.clone())
     };
 
