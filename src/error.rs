@@ -20,6 +20,7 @@ pub enum PipeError {
     MultipartError(multer::Error),
     IoError(std::io::Error),
     UploadError(hyper::Error),
+    ForwardError(String),
 }
 
 impl PipeError {
@@ -42,6 +43,7 @@ impl PipeError {
             Self::Draining | Self::TooManyOpenFiles | Self::DiskFull | Self::DiskQuotaExceeded => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            Self::ForwardError(_) => StatusCode::BAD_GATEWAY,
             Self::IoError(_) | Self::UploadError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -61,6 +63,7 @@ impl PipeError {
             Self::MultipartError(e) => format!("multipart parse error: {e}"),
             Self::IoError(e) => format!("internal error: {e}"),
             Self::UploadError(e) => format!("upload failed: {e}"),
+            Self::ForwardError(e) => format!("forward failed: {e}"),
         }
     }
 

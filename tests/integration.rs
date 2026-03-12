@@ -754,6 +754,117 @@ async fn reader_survives_spill_during_streaming() {
     assert_eq!(String::from_utf8(received).unwrap(), expected);
 }
 
+// --- Forward upload to external URL via X-Forward-Url ---
+
+#[tokio::test]
+async fn forward_upload_to_external_url() {
+    // Use a second file-pipe instance as the "S3" target.
+    let target_srv = spawn_server().await;
+    let target_base = base_url(&target_srv);
+
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    // PUT with X-Forward-Url header — data should land on both servers
+    let resp = client
+        .put(format!("{base}/forwarded"))
+        .header("x-forward-url", format!("{target_base}/forwarded"))
+        .body("hello from forward")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // Local pipe should have the data
+    let resp = client
+        .get(format!("{base}/forwarded"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "hello from forward");
+
+    // Target server should also have the data
+    let resp = client
+        .get(format!("{target_base}/forwarded"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "hello from forward");
+}
+
+#[tokio::test]
+async fn forward_upload_bad_url_returns_502() {
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let resp = client
+        .put(format!("{base}/fwd-bad"))
+        .header("x-forward-url", "http://127.0.0.1:1/nope")
+        .body("data")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 502);
+}
+
+#[tokio::test]
+async fn forward_streaming_upload() {
+    // Stream data through with forward — both local and target get everything
+    let target_srv = spawn_server().await;
+    let target_base = base_url(&target_srv);
+
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let base2 = base.clone();
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+    let put_handle = tokio::spawn(async move {
+        Client::new()
+            .put(format!("{base2}/fwd-stream"))
+            .header("x-forward-url", format!("{target_base}/fwd-stream"))
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    for i in 0..5 {
+        body_tx
+            .send(Ok(Bytes::from(format!("chunk{i}-"))))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    drop(body_tx);
+
+    let resp = put_handle.await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let expected = "chunk0-chunk1-chunk2-chunk3-chunk4-";
+
+    // Local pipe
+    let resp = Client::new()
+        .get(format!("{base}/fwd-stream"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.text().await.unwrap(), expected);
+}
+
 // --- Second GET after spill must read complete data from disk ---
 
 #[tokio::test]

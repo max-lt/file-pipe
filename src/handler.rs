@@ -74,6 +74,13 @@ async fn handle_put(
         None
     };
 
+    // Optional: forward upload to an external URL (e.g. S3 presigned PUT)
+    let forward_url = req
+        .headers()
+        .get("x-forward-url")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
     // Create temp file path (file created lazily on spill).
     // BLAKE3 hash of the key to avoid collisions (e.g. "a/b" vs "a_b").
     let file_path = state.data_dir.join(format!(
@@ -113,13 +120,60 @@ async fn handle_put(
         waiter.notify_waiters();
     }
 
+    // Set up forward channel if a forward URL was provided
+    let (forward_tx, forward_task) = if let Some(url) = forward_url {
+        eprintln!("[PUT] key={key} forwarding to {url}");
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+        let body_stream = tokio_stream::StreamExt::map(
+            ReceiverStream::new(rx),
+            Ok::<_, std::io::Error>,
+        );
+        let task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .put(url)
+                .body(reqwest::Body::wrap_stream(body_stream))
+                .send()
+                .await
+        });
+        (Some(tx), Some(task))
+    } else {
+        (None, None)
+    };
+
     eprintln!("[PUT] key={key} upload started");
 
-    if let Some(boundary) = boundary {
-        stream_multipart(key, req.into_body(), boundary, entry, state).await
+    let resp = if let Some(boundary) = boundary {
+        stream_multipart(key, req.into_body(), boundary, entry, state, forward_tx).await
     } else {
-        stream_raw(key, req.into_body(), entry, state).await
+        stream_raw(key, req.into_body(), entry, state, forward_tx).await
+    };
+
+    // If local upload failed, return that error
+    if resp.status() != StatusCode::OK {
+        return resp;
     }
+
+    // Check forward result
+    if let Some(task) = forward_task {
+        match task.await {
+            Ok(Ok(r)) if r.status().is_success() => {
+                eprintln!("[FORWARD] success ({})", r.status());
+            }
+            Ok(Ok(r)) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                return PipeError::ForwardError(format!("{status}: {body}")).into_response();
+            }
+            Ok(Err(e)) => {
+                return PipeError::ForwardError(e.to_string()).into_response();
+            }
+            Err(e) => {
+                return PipeError::ForwardError(e.to_string()).into_response();
+            }
+        }
+    }
+
+    resp
 }
 
 /// Stream a raw (non-multipart) body into the pipe.
@@ -128,12 +182,17 @@ async fn stream_raw(
     mut body: Incoming,
     entry: Arc<PipeEntry>,
     state: Arc<AppState>,
+    forward_tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
 ) -> Response<BoxBody> {
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
                     if !data.is_empty() {
+                        if let Some(ref tx) = forward_tx {
+                            let _ = tx.send(data.clone()).await;
+                        }
+
                         if let Err(resp) = write_chunk(&entry, &state, &data).await {
                             // done already set inside write_chunk
                             schedule_cleanup(key, state, entry);
@@ -164,6 +223,7 @@ async fn stream_multipart(
     boundary: String,
     entry: Arc<PipeEntry>,
     state: Arc<AppState>,
+    forward_tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
 ) -> Response<BoxBody> {
     let stream = body.into_data_stream();
     // Multer defaults are u64::MAX for stream/field sizes — our own
@@ -207,6 +267,10 @@ async fn stream_multipart(
         match field.chunk().await {
             Ok(Some(data)) => {
                 if !data.is_empty() {
+                    if let Some(ref tx) = forward_tx {
+                        let _ = tx.send(Bytes::copy_from_slice(&data)).await;
+                    }
+
                     if let Err(resp) = write_chunk(&entry, &state, &data).await {
                         // done already set inside write_chunk
                         schedule_cleanup(key, state, entry);
