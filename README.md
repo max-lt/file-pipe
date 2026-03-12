@@ -27,13 +27,15 @@ The original filename and content type are forwarded to readers via `Content-Dis
 
 ## Options
 
-```
--l, --listen <ADDR>        Address to listen on [default: 0.0.0.0:3000]
--d, --data-dir <DIR>       Directory for temporary files [default: $TMPDIR]
--M, --max-memory <SIZE>    Maximum memory usage (e.g. "256M", "1G")
--D, --max-disk <SIZE>      Maximum disk usage (e.g. "1G", "500M")
--s, --spill-threshold <SIZE>  Files smaller than this stay in memory [default: 1M]
-```
+All options can be set via CLI flags or environment variables. CLI flags take precedence.
+
+| Flag                    | Env var           | Default        | Description                              |
+| ----------------------- | ----------------- | -------------- | ---------------------------------------- |
+| `-l, --listen`          | `LISTEN`          | `0.0.0.0:3000` | Address to listen on                     |
+| `-d, --data-dir`        | `DATA_DIR`        | `$TMPDIR`      | Directory for temporary files            |
+| `-M, --max-memory`      | `MAX_MEMORY`      | unlimited      | Maximum memory usage (e.g. `256M`, `1G`) |
+| `-D, --max-disk`        | `MAX_DISK`        | unlimited      | Maximum disk usage (e.g. `1G`, `500M`)   |
+| `-s, --spill-threshold` | `SPILL_THRESHOLD` | `1M`           | Files smaller than this stay in memory   |
 
 Small files stay in memory for fast streaming. When a file exceeds the spill threshold or memory is full, data spills to disk transparently.
 

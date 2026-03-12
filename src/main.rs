@@ -6,23 +6,23 @@ use std::path::PathBuf;
 #[command(about = "HTTP pipe service — stream uploads to downloads in real-time")]
 struct Args {
     /// Address to listen on
-    #[arg(short, long, default_value = "0.0.0.0:3000")]
+    #[arg(short, long, default_value = "0.0.0.0:3000", env = "LISTEN")]
     listen: String,
 
     /// Directory for temporary files
-    #[arg(short, long, default_value_t = std::env::temp_dir().display().to_string())]
+    #[arg(short, long, default_value_t = std::env::temp_dir().display().to_string(), env = "DATA_DIR")]
     data_dir: String,
 
     /// Maximum disk usage (e.g. "1G", "500M", "1024K")
-    #[arg(short = 'D', long, value_parser = parse_size)]
+    #[arg(short = 'D', long, value_parser = parse_size, env = "MAX_DISK")]
     max_disk: Option<u64>,
 
     /// Maximum memory usage (e.g. "256M", "1G"). When full, new data spills to disk.
-    #[arg(short = 'M', long, value_parser = parse_size)]
+    #[arg(short = 'M', long, value_parser = parse_size, env = "MAX_MEMORY")]
     max_memory: Option<u64>,
 
     /// Files smaller than this stay in memory (default: "1M")
-    #[arg(short, long, value_parser = parse_size, default_value = "1M")]
+    #[arg(short, long, value_parser = parse_size, default_value = "1M", env = "SPILL_THRESHOLD")]
     spill_threshold: u64,
 }
 
