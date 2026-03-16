@@ -46,6 +46,10 @@ pub struct AppState {
     pub memory_usage: AtomicU64,
     pub max_memory: Option<u64>,
     pub spill_threshold: u64,
+    /// Seconds to keep an entry after PUT completes.
+    pub put_ttl: u64,
+    /// Seconds to keep an entry after first GET completes.
+    pub get_ttl: u64,
 }
 
 /// Remove a key's entry only if it is the exact same Arc (pointer equality).

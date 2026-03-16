@@ -18,6 +18,10 @@ pub struct ServerConfig {
     pub max_memory: Option<u64>,
     /// Files smaller than this stay in memory (default: 1MB).
     pub spill_threshold: u64,
+    /// Seconds to keep an entry after PUT completes (default: 30s).
+    pub put_ttl: u64,
+    /// Seconds to keep an entry after first GET completes (default: 5s).
+    pub get_ttl: u64,
 }
 
 impl Default for ServerConfig {
@@ -28,6 +32,8 @@ impl Default for ServerConfig {
             max_disk_usage: None,
             max_memory: None,
             spill_threshold: 1024 * 1024,
+            put_ttl: 30,
+            get_ttl: 5,
         }
     }
 }
@@ -96,6 +102,8 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
         memory_usage: AtomicU64::new(0),
         max_memory: config.max_memory,
         spill_threshold: config.spill_threshold,
+        put_ttl: config.put_ttl,
+        get_ttl: config.get_ttl,
     });
 
     let listener = TcpListener::bind(&config.addr).await?;

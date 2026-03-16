@@ -307,7 +307,7 @@ async fn finalize_upload(key: &str, entry: &PipeEntry) {
 
 fn schedule_cleanup(key: String, state: Arc<AppState>, entry: Arc<PipeEntry>) {
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(state.put_ttl)).await;
         cleanup_entry(&state, &key, &entry).await;
     });
 }
@@ -567,7 +567,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
                     notified.await;
                 }
 
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(state_clone.get_ttl)).await;
                 cleanup_entry(&state_clone, &key_clone, &entry_clone).await;
             });
         }

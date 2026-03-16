@@ -24,6 +24,14 @@ struct Args {
     /// Files smaller than this stay in memory (default: "1M")
     #[arg(short, long, value_parser = parse_size, default_value = "1M", env = "SPILL_THRESHOLD")]
     spill_threshold: u64,
+
+    /// Seconds to keep an entry after PUT completes (default: 30)
+    #[arg(long, default_value_t = 30, env = "PUT_TTL")]
+    put_ttl: u64,
+
+    /// Seconds to keep an entry after first GET completes (default: 5)
+    #[arg(long, default_value_t = 5, env = "GET_TTL")]
+    get_ttl: u64,
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -54,6 +62,8 @@ async fn main() {
         max_disk_usage: args.max_disk,
         max_memory: args.max_memory,
         spill_threshold: args.spill_threshold,
+        put_ttl: args.put_ttl,
+        get_ttl: args.get_ttl,
     };
 
     if let Some(max) = config.max_memory {
