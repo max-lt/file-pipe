@@ -81,7 +81,6 @@ async fn handle_put(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // Create temp file path (file created lazily on spill).
     // BLAKE3 hash of the key to avoid collisions (e.g. "a/b" vs "a_b").
     let file_path = state.data_dir.join(format!(
         "pipe-{}-{}",
@@ -100,8 +99,6 @@ async fn handle_put(
         }),
         written: 0.into(),
         done: false.into(),
-        buffer: tokio::sync::RwLock::new(Vec::new()),
-        spilled: false.into(),
         file: tokio::sync::Mutex::new(None),
         path: file_path,
         notify: tokio::sync::Notify::new(),
@@ -114,6 +111,16 @@ async fn handle_put(
             e.insert(entry.clone());
         }
     }
+
+    // Create the backing file before any reader can observe data
+    let file = match crate::io::create_rw(&entry.path).await {
+        Ok(f) => f,
+        Err(e) => {
+            state.pipes.remove(&key);
+            return PipeError::from_io(e).into_response();
+        }
+    };
+    *entry.file.lock().await = Some(file);
 
     // Notify GETs waiting for this specific key
     if let Some((_, waiter)) = state.key_waiters.remove(&key) {
@@ -194,7 +201,6 @@ async fn stream_raw(
                         }
 
                         if let Err(resp) = write_chunk(&entry, &state, &data).await {
-                            // done already set inside write_chunk
                             schedule_cleanup(key, state, entry);
                             return resp;
                         }
@@ -227,7 +233,7 @@ async fn stream_multipart(
 ) -> Response<BoxBody> {
     let stream = body.into_data_stream();
     // Multer defaults are u64::MAX for stream/field sizes — our own
-    // disk/memory quotas handle data limits, so no constraints needed.
+    // disk quota handles data limits, so no constraints needed.
     let mut multipart = multer::Multipart::new(stream, boundary);
 
     // Find the first field (we only support a single file per upload)
@@ -272,7 +278,6 @@ async fn stream_multipart(
                     }
 
                     if let Err(resp) = write_chunk(&entry, &state, &data).await {
-                        // done already set inside write_chunk
                         schedule_cleanup(key, state, entry);
                         return resp;
                     }
@@ -295,14 +300,10 @@ async fn stream_multipart(
 
 async fn finalize_upload(key: &str, entry: &PipeEntry) {
     let total_bytes = entry.written.load(Ordering::Relaxed);
-    let spilled = entry.spilled.load(Ordering::Relaxed);
     entry.meta.lock().await.upload_ended_at = Some(Instant::now());
     entry.done.store(true, Ordering::Release);
     entry.notify.notify_waiters();
-    eprintln!(
-        "[PUT] key={key} upload complete: {total_bytes} bytes ({})",
-        if spilled { "disk" } else { "memory" }
-    );
+    eprintln!("[PUT] key={key} upload complete: {total_bytes} bytes");
 }
 
 fn schedule_cleanup(key: String, state: Arc<AppState>, entry: Arc<PipeEntry>) {
@@ -319,126 +320,8 @@ fn fail_upload(key: String, entry: Arc<PipeEntry>, state: Arc<AppState>) {
     schedule_cleanup(key, state, entry);
 }
 
-/// Write a chunk to the pipe, handling memory → disk spill and quota.
+/// Write a chunk to the pipe's backing file, enforcing disk quota.
 async fn write_chunk(
-    entry: &PipeEntry,
-    state: &AppState,
-    data: &[u8],
-) -> Result<(), Response<BoxBody>> {
-    let len = data.len() as u64;
-
-    if entry.spilled.load(Ordering::Relaxed) {
-        // Already on disk — write directly to file
-        return write_to_disk(entry, state, data).await;
-    }
-
-    let current_written = entry.written.load(Ordering::Relaxed);
-
-    if current_written + len > state.spill_threshold {
-        // Per-file threshold exceeded — spill
-        return spill_to_disk(entry, state, data).await;
-    }
-
-    // Try to reserve memory (optimistic fetch_add)
-    let prev_mem = state.memory_usage.fetch_add(len, Ordering::Relaxed);
-
-    if state.max_memory.is_some_and(|max| prev_mem + len > max) {
-        // Memory full — rollback and force-spill to disk
-        state.memory_usage.fetch_sub(len, Ordering::Relaxed);
-        return spill_to_disk(entry, state, data).await;
-    }
-
-    // Memory reserved — append to buffer
-    let mut buf = entry.buffer.write().await;
-    buf.extend_from_slice(data);
-    drop(buf);
-    entry.written.fetch_add(len, Ordering::Release);
-    entry.notify.notify_waiters();
-    Ok(())
-}
-
-/// Spill in-memory buffer to disk and write the new chunk.
-async fn spill_to_disk(
-    entry: &PipeEntry,
-    state: &AppState,
-    new_data: &[u8],
-) -> Result<(), Response<BoxBody>> {
-    let buf = entry.buffer.read().await;
-    let buf_len = buf.len() as u64;
-    let total_len = buf_len + new_data.len() as u64;
-
-    // Reserve disk quota for buffer + new data
-    if let Some(max) = state.max_disk_usage {
-        let prev = state.disk_usage.fetch_add(total_len, Ordering::Relaxed);
-
-        if prev + total_len > max {
-            state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
-            drop(buf);
-            entry.done.store(true, Ordering::Release);
-            entry.notify.notify_waiters();
-            return Err(PipeError::DiskQuotaExceeded.into_response());
-        }
-    } else {
-        state.disk_usage.fetch_add(total_len, Ordering::Relaxed);
-    }
-
-    // Create file and write buffer + new data
-    let file = match crate::io::create_rw(&entry.path).await {
-        Ok(f) => f,
-        Err(e) => {
-            state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
-            drop(buf);
-            entry.done.store(true, Ordering::Release);
-            entry.notify.notify_waiters();
-            return Err(PipeError::from_io(e).into_response());
-        }
-    };
-
-    let file = match crate::io::write_at(file, &buf, 0).await {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = crate::io::remove(&entry.path).await;
-            state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
-            drop(buf);
-            entry.done.store(true, Ordering::Release);
-            entry.notify.notify_waiters();
-            return Err(PipeError::from_io(e).into_response());
-        }
-    };
-
-    let file = match crate::io::write_at(file, new_data, buf_len).await {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = crate::io::remove(&entry.path).await;
-            state.disk_usage.fetch_sub(total_len, Ordering::Relaxed);
-            drop(buf);
-            entry.done.store(true, Ordering::Release);
-            entry.notify.notify_waiters();
-            return Err(PipeError::from_io(e).into_response());
-        }
-    };
-
-    drop(buf);
-
-    // Buffer moved from memory to disk — release memory quota
-    state.memory_usage.fetch_sub(buf_len, Ordering::Relaxed);
-
-    *entry.file.lock().await = Some(file);
-    // Set spilled BEFORE bumping written: readers load written before
-    // spilled, so if a reader sees the new written value, its Acquire
-    // synchronizes with this Release, guaranteeing it also sees
-    // spilled=true and reads from disk instead of the buffer.
-    entry.spilled.store(true, Ordering::Release);
-    entry
-        .written
-        .fetch_add(new_data.len() as u64, Ordering::Release);
-    entry.notify.notify_waiters();
-
-    Ok(())
-}
-
-/// Write a chunk directly to disk (already spilled).
-async fn write_to_disk(
     entry: &PipeEntry,
     state: &AppState,
     data: &[u8],
@@ -545,7 +428,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         if meta.first_get_at.is_none() {
             meta.first_get_at = Some(now);
 
-            // Schedule cleanup 5s after upload finishes (or immediately if already done).
+            // Schedule cleanup get_ttl seconds after upload finishes (or immediately if already done).
             // We must wait for the upload to complete before removing the entry.
             let state_clone = state.clone();
             let key_clone = key.clone();
@@ -587,54 +470,36 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
             let notified = entry.notify.notified();
 
             let is_done = entry.done.load(Ordering::Acquire);
-            // Load written BEFORE spilled: if we see a written value that
-            // includes post-spill data, our Acquire synchronizes with the
-            // writer's Release on written, which happens-after the Release
-            // store of spilled=true. So we are guaranteed to see spilled=true
-            // and will read from disk, not the buffer.
             let written = entry.written.load(Ordering::Acquire);
-            let spilled = entry.spilled.load(Ordering::Acquire);
 
             if pos < written {
-                if !spilled {
-                    // Read from in-memory buffer (read lock — multiple readers OK)
-                    let buf = entry.buffer.read().await;
-                    let chunk = Bytes::copy_from_slice(&buf[pos as usize..written as usize]);
-                    drop(buf);
-                    pos = written;
-
-                    if tx.send(Ok(Frame::data(chunk))).await.is_err() {
+                // Clone the file handle once per wake-up, reuse across reads
+                let file_guard = entry.file.lock().await;
+                let mut file = match file_guard.as_ref().and_then(|f| f.try_clone().ok()) {
+                    Some(f) => f,
+                    None => {
+                        eprintln!("[GET] failed to clone file handle");
                         return;
                     }
-                } else {
-                    // Read from disk using pread — clone handle once, reuse it
-                    let file_guard = entry.file.lock().await;
-                    let mut file = match file_guard.as_ref().and_then(|f| f.try_clone().ok()) {
-                        Some(f) => f,
-                        None => {
-                            eprintln!("[GET] failed to clone file handle");
-                            return;
-                        }
-                    };
-                    drop(file_guard);
+                };
+                drop(file_guard);
 
-                    while pos < written {
-                        let to_read = std::cmp::min(READ_BUF_SIZE as u64, written - pos) as usize;
+                while pos < written {
+                    let to_read = std::cmp::min(READ_BUF_SIZE as u64, written - pos) as usize;
 
-                        match crate::io::read_at(file, pos, to_read).await {
-                            Ok((buf, f)) if !buf.is_empty() => {
-                                file = f;
-                                pos += buf.len() as u64;
+                    match crate::io::read_at(file, pos, to_read).await {
+                        Ok((buf, f)) if !buf.is_empty() => {
+                            file = f;
+                            pos += buf.len() as u64;
 
-                                if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Ok(_) => break,
-                            Err(e) => {
-                                eprintln!("[GET] read error: {e}");
+                            if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
                                 return;
                             }
+                        }
+                        Ok(_) => break,
+                        Err(e) => {
+                            eprintln!("[GET] read error: {e}");
+                            return;
                         }
                     }
                 }

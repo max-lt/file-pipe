@@ -339,7 +339,6 @@ async fn disk_quota_enforced() {
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
         max_disk_usage: Some(100),
-        spill_threshold: 0,
         ..Default::default()
     })
     .await
@@ -367,126 +366,6 @@ async fn disk_quota_enforced() {
 
     assert_eq!(resp.status(), 503);
     assert!(resp.text().await.unwrap().contains("disk quota"));
-}
-
-#[tokio::test]
-async fn memory_limit_spills_to_disk() {
-    // max_memory=80 bytes, spill_threshold=1M (high), so small files normally stay in memory.
-    // But once global memory is full, new uploads should spill to disk instead of failing.
-    let srv = file_pipe::start_server(file_pipe::ServerConfig {
-        addr: "127.0.0.1:0".into(),
-        max_memory: Some(80),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let base = base_url(&srv);
-    let client = Client::new();
-
-    // First PUT: 50 bytes — fits in memory
-    let resp = client
-        .put(format!("{base}/a"))
-        .body("x".repeat(50))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 200);
-
-    // Second PUT: 50 bytes — would exceed 80 byte memory limit, should spill to disk (not fail)
-    let resp = client
-        .put(format!("{base}/b"))
-        .body("y".repeat(50))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 200);
-
-    // Both should still be readable
-    let resp = client.get(format!("{base}/a")).send().await.unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text().await.unwrap(), "x".repeat(50));
-
-    let resp = client.get(format!("{base}/b")).send().await.unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text().await.unwrap(), "y".repeat(50));
-}
-
-#[tokio::test]
-async fn memory_limit_with_disk_quota() {
-    // max_memory=80, max_disk=60, spill_threshold=1M.
-    // First file (50B) fits in memory. Second file (50B) spills to disk (memory full).
-    // Third file (50B) also tries to spill but disk quota is exceeded → 503.
-    let srv = file_pipe::start_server(file_pipe::ServerConfig {
-        addr: "127.0.0.1:0".into(),
-        max_memory: Some(80),
-        max_disk_usage: Some(60),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let base = base_url(&srv);
-    let client = Client::new();
-
-    // First: 50B in memory — OK
-    let resp = client
-        .put(format!("{base}/mem"))
-        .body("a".repeat(50))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 200);
-
-    // Second: 50B spills to disk (memory full) — OK (fits in 60B disk quota)
-    let resp = client
-        .put(format!("{base}/disk"))
-        .body("b".repeat(50))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 200);
-
-    // Third: 50B tries to spill but disk quota exceeded — 503
-    let resp = client
-        .put(format!("{base}/fail"))
-        .body("c".repeat(50))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 503);
-    assert!(resp.text().await.unwrap().contains("disk quota"));
-}
-
-#[tokio::test]
-async fn spill_threshold_forces_disk() {
-    // spill_threshold=0 means everything goes to disk immediately.
-    // Verify data is still readable.
-    let srv = file_pipe::start_server(file_pipe::ServerConfig {
-        addr: "127.0.0.1:0".into(),
-        spill_threshold: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let base = base_url(&srv);
-    let client = Client::new();
-
-    let data = "this goes straight to disk";
-
-    client
-        .put(format!("{base}/disk"))
-        .body(data)
-        .send()
-        .await
-        .unwrap();
-
-    let resp = client.get(format!("{base}/disk")).send().await.unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text().await.unwrap(), data);
 }
 
 #[tokio::test]
@@ -591,7 +470,6 @@ async fn keys_with_slash_vs_underscore_dont_collide() {
     // Both should store and return their own data independently.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
-        spill_threshold: 0, // force disk so file paths matter
         ..Default::default()
     })
     .await
@@ -674,12 +552,11 @@ async fn multipart_filename_control_chars_are_stripped() {
 // --- Spill during active streaming ---
 
 #[tokio::test]
-async fn reader_survives_spill_during_streaming() {
-    // spill_threshold=64 so the first few chunks stay in memory, then spill to disk.
-    // A reader actively streaming should receive all data correctly across the transition.
+async fn reader_survives_long_streaming_upload() {
+    // A reader actively streaming should receive all data correctly while
+    // the writer trickles many small chunks.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
-        spill_threshold: 64,
         ..Default::default()
     })
     .await
@@ -868,12 +745,11 @@ async fn forward_streaming_upload() {
 // --- Second GET after spill must read complete data from disk ---
 
 #[tokio::test]
-async fn second_reader_after_spill_gets_full_data() {
-    // GET1 connects while data is in memory. The stream spills to disk.
-    // GET2 connects after the spill. Both must receive all the data.
+async fn second_reader_mid_stream_gets_full_data() {
+    // GET1 connects early in the upload. GET2 connects later, while the
+    // upload is still in progress. Both must receive all the data.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
-        spill_threshold: 64,
         ..Default::default()
     })
     .await
@@ -1040,13 +916,12 @@ async fn multiple_readers_during_active_streaming() {
     }
 }
 
-// --- Large file through disk spill with integrity check ---
+// --- Large file integrity check ---
 
 #[tokio::test]
-async fn large_file_through_disk_spill() {
+async fn large_file_integrity() {
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
-        spill_threshold: 1024, // 1KB threshold
         ..Default::default()
     })
     .await
@@ -1367,13 +1242,11 @@ async fn stale_cleanup_timer_does_not_delete_recycled_key() {
 // --- Spill race: reader must not OOB access buffer during spill ---
 
 #[tokio::test]
-async fn spill_race_concurrent_readers_stress() {
-    // Stress test for the spill race: many readers streaming while the writer
-    // triggers a memory→disk spill. If the reader sees the bumped `written`
-    // but stale `spilled=false`, it would OOB-index into the in-memory buffer.
+async fn concurrent_readers_streaming_stress() {
+    // Stress test: many readers streaming while the writer pushes chunks.
+    // Catches races between the reader's `written` load and the data path.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
-        spill_threshold: 64,
         ..Default::default()
     })
     .await
@@ -1579,7 +1452,6 @@ async fn disk_quota_exceeded_during_streaming() {
     // The reader should receive whatever was written before the quota hit.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
-        spill_threshold: 0,
         max_disk_usage: Some(200),
         ..Default::default()
     })
@@ -1831,7 +1703,6 @@ async fn binary_data_integrity_all_byte_values() {
     // Ensure all 256 byte values survive the roundtrip without corruption.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
-        spill_threshold: 0, // force disk path
         ..Default::default()
     })
     .await
@@ -1879,10 +1750,9 @@ async fn binary_data_integrity_all_byte_values() {
 // --- Multipart large file through disk spill ---
 
 #[tokio::test]
-async fn multipart_large_file_spills_to_disk() {
+async fn multipart_large_file_integrity() {
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
-        spill_threshold: 512,
         ..Default::default()
     })
     .await

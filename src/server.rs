@@ -15,9 +15,6 @@ pub struct ServerConfig {
     pub addr: String,
     pub data_dir: PathBuf,
     pub max_disk_usage: Option<u64>,
-    pub max_memory: Option<u64>,
-    /// Files smaller than this stay in memory (default: 1MB).
-    pub spill_threshold: u64,
     /// Seconds to keep an entry after PUT completes (default: 30s).
     pub put_ttl: u64,
     /// Seconds to keep an entry after first GET completes (default: 5s).
@@ -30,8 +27,6 @@ impl Default for ServerConfig {
             addr: "0.0.0.0:3000".into(),
             data_dir: std::env::temp_dir(),
             max_disk_usage: None,
-            max_memory: None,
-            spill_threshold: 1024 * 1024,
             put_ttl: 30,
             get_ttl: 5,
         }
@@ -99,9 +94,6 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
         data_dir: config.data_dir,
         disk_usage: AtomicU64::new(0),
         max_disk_usage: config.max_disk_usage,
-        memory_usage: AtomicU64::new(0),
-        max_memory: config.max_memory,
-        spill_threshold: config.spill_threshold,
         put_ttl: config.put_ttl,
         get_ttl: config.get_ttl,
     });

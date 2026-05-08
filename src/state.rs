@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify};
 
 /// Metadata behind a mutex — only accessed for first GET, not on the hot path.
 pub struct PipeMetadata {
@@ -22,13 +22,7 @@ pub struct PipeEntry {
     pub written: AtomicU64,
     /// Upload complete — set once by the writer, checked by readers.
     pub done: AtomicBool,
-    /// In-memory buffer for small files. Once spilled, no longer appended to
-    /// but kept alive so in-flight readers can finish reading from it.
-    /// RwLock so multiple readers can read concurrently.
-    pub buffer: RwLock<Vec<u8>>,
-    /// Set to true once data has been spilled to disk.
-    pub spilled: AtomicBool,
-    /// File handle and path — only valid after spill.
+    /// File handle (created eagerly when the entry is registered).
     pub file: Mutex<Option<std::fs::File>>,
     pub path: PathBuf,
     pub notify: Notify,
@@ -43,9 +37,6 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub disk_usage: AtomicU64,
     pub max_disk_usage: Option<u64>,
-    pub memory_usage: AtomicU64,
-    pub max_memory: Option<u64>,
-    pub spill_threshold: u64,
     /// Seconds to keep an entry after PUT completes.
     pub put_ttl: u64,
     /// Seconds to keep an entry after first GET completes.
@@ -67,17 +58,12 @@ pub async fn cleanup_entry(state: &AppState, key: &str, expected: &Arc<PipeEntry
 
 pub(crate) async fn free_entry(state: &AppState, key: &str, entry: &PipeEntry) {
     let written = entry.written.load(Ordering::Relaxed);
+    state.disk_usage.fetch_sub(written, Ordering::Relaxed);
 
-    if entry.spilled.load(Ordering::Relaxed) {
-        state.disk_usage.fetch_sub(written, Ordering::Relaxed);
-
-        if let Err(e) = crate::io::remove(&entry.path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
-            }
+    if let Err(e) = crate::io::remove(&entry.path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
         }
-    } else {
-        state.memory_usage.fetch_sub(written, Ordering::Relaxed);
     }
 
     eprintln!("[CLEANUP] key={key} removed ({written} bytes freed)");

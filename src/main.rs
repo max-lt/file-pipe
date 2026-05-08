@@ -17,14 +17,6 @@ struct Args {
     #[arg(short = 'D', long, value_parser = parse_size, env = "MAX_DISK")]
     max_disk: Option<u64>,
 
-    /// Maximum memory usage (e.g. "256M", "1G"). When full, new data spills to disk.
-    #[arg(short = 'M', long, value_parser = parse_size, env = "MAX_MEMORY")]
-    max_memory: Option<u64>,
-
-    /// Files smaller than this stay in memory (default: "1M")
-    #[arg(short, long, value_parser = parse_size, default_value = "1M", env = "SPILL_THRESHOLD")]
-    spill_threshold: u64,
-
     /// Seconds to keep an entry after PUT completes (default: 30)
     #[arg(long, default_value_t = 30, env = "PUT_TTL")]
     put_ttl: u64,
@@ -60,21 +52,13 @@ async fn main() {
         addr: args.listen,
         data_dir: PathBuf::from(args.data_dir),
         max_disk_usage: args.max_disk,
-        max_memory: args.max_memory,
-        spill_threshold: args.spill_threshold,
         put_ttl: args.put_ttl,
         get_ttl: args.get_ttl,
     };
 
-    if let Some(max) = config.max_memory {
-        eprintln!("max memory: {}", format_size(max));
-    }
-
     if let Some(max) = config.max_disk_usage {
         eprintln!("max disk usage: {}", format_size(max));
     }
-
-    eprintln!("spill threshold: {}", format_size(config.spill_threshold));
 
     let handle = file_pipe::start_server(config).await.unwrap_or_else(|e| {
         eprintln!("failed to start server: {e}");
