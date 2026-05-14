@@ -380,7 +380,7 @@ async fn write_chunk(
 }
 
 async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(state.get_wait_timeout);
 
     // Wait for the key to appear (up to 5s)
     let entry = loop {

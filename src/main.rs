@@ -24,6 +24,10 @@ struct Args {
     /// Seconds to keep an entry after first GET completes (default: 5)
     #[arg(long, default_value_t = 5, env = "GET_TTL")]
     get_ttl: u64,
+
+    /// Seconds a GET waits for a missing key before returning 404 (default: 5)
+    #[arg(long, default_value_t = 5, env = "GET_WAIT_TIMEOUT")]
+    get_wait_timeout: u64,
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -54,6 +58,7 @@ async fn main() {
         max_disk_usage: args.max_disk,
         put_ttl: args.put_ttl,
         get_ttl: args.get_ttl,
+        get_wait_timeout: args.get_wait_timeout,
     };
 
     if let Some(max) = config.max_disk_usage {

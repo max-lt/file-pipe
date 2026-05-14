@@ -19,6 +19,8 @@ pub struct ServerConfig {
     pub put_ttl: u64,
     /// Seconds to keep an entry after first GET completes (default: 5s).
     pub get_ttl: u64,
+    /// Seconds a GET waits for a missing key before returning 404 (default: 5s).
+    pub get_wait_timeout: u64,
 }
 
 impl Default for ServerConfig {
@@ -29,6 +31,7 @@ impl Default for ServerConfig {
             max_disk_usage: None,
             put_ttl: 30,
             get_ttl: 5,
+            get_wait_timeout: 5,
         }
     }
 }
@@ -96,6 +99,7 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
         max_disk_usage: config.max_disk_usage,
         put_ttl: config.put_ttl,
         get_ttl: config.get_ttl,
+        get_wait_timeout: config.get_wait_timeout,
     });
 
     let listener = TcpListener::bind(&config.addr).await?;
