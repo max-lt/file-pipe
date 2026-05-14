@@ -766,6 +766,45 @@ async fn forward_streaming_upload() {
     assert_eq!(resp.text().await.unwrap(), expected);
 }
 
+#[cfg(feature = "forward")]
+#[tokio::test]
+async fn forward_propagates_content_length_for_raw_upload() {
+    // S3 presigned PUTs are typically signed with a fixed Content-Length, so
+    // forwarding without one (default reqwest chunked) returns 403 from S3.
+    // When the inbound raw PUT has Content-Length, file-pipe must forward it.
+    let target_srv = spawn_server().await;
+    let target_base = base_url(&target_srv);
+
+    let srv = spawn_server_with_forward().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let body = b"hello world".to_vec();
+    let resp = client
+        .put(format!("{base}/cl"))
+        .header("x-forward-url", format!("{target_base}/cl"))
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // GET from target — file-pipe exposes the inbound Content-Length on GET,
+    // so this asserts the forward request actually carried the header.
+    let resp = client
+        .get(format!("{target_base}/cl"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.headers().get("content-length").unwrap(),
+        &body.len().to_string()
+    );
+    assert_eq!(resp.bytes().await.unwrap().to_vec(), body);
+}
+
 #[tokio::test]
 async fn forward_disabled_by_default_returns_403() {
     // Default server has allow_forward=false; X-Forward-Url must be rejected

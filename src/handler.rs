@@ -145,12 +145,21 @@ async fn handle_put(
             ReceiverStream::new(rx),
             Ok::<_, std::io::Error>,
         );
+        // For raw uploads with a known size, forward Content-Length so the
+        // upstream (e.g. an S3 presigned PUT signed with a fixed size) gets
+        // a proper header instead of chunked transfer encoding. Multipart
+        // inbound Content-Length includes framing and is not meaningful.
+        let forward_content_length = if boundary.is_none() { content_length } else { None };
         let task = tokio::spawn(async move {
-            reqwest::Client::new()
+            let mut req = reqwest::Client::new()
                 .put(url)
-                .body(reqwest::Body::wrap_stream(body_stream))
-                .send()
-                .await
+                .body(reqwest::Body::wrap_stream(body_stream));
+
+            if let Some(len) = forward_content_length {
+                req = req.header(reqwest::header::CONTENT_LENGTH, len);
+            }
+
+            req.send().await
         });
         (Some(tx), Some(task))
     } else {
