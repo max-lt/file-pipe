@@ -17,6 +17,10 @@ struct Args {
     #[arg(short = 'D', long, value_parser = parse_size, env = "MAX_DISK")]
     max_disk: Option<u64>,
 
+    /// Maximum bytes for a single pipe (e.g. "100M", "1G")
+    #[arg(short = 'P', long, value_parser = parse_size, env = "MAX_PIPE_SIZE")]
+    max_pipe_size: Option<u64>,
+
     /// Seconds to keep an entry after PUT completes (default: 30)
     #[arg(long, default_value_t = 30, env = "PUT_TTL")]
     put_ttl: u64,
@@ -62,6 +66,7 @@ async fn main() {
         addr: args.listen,
         data_dir: PathBuf::from(args.data_dir),
         max_disk_usage: args.max_disk,
+        max_pipe_size: args.max_pipe_size,
         put_ttl: args.put_ttl,
         get_ttl: args.get_ttl,
         get_wait_timeout: args.get_wait_timeout,
@@ -71,6 +76,10 @@ async fn main() {
 
     if let Some(max) = config.max_disk_usage {
         eprintln!("max disk usage: {}", format_size(max));
+    }
+
+    if let Some(max) = config.max_pipe_size {
+        eprintln!("max pipe size: {}", format_size(max));
     }
 
     let handle = file_pipe::start_server(config).await.unwrap_or_else(|e| {

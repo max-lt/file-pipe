@@ -37,6 +37,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub disk_usage: AtomicU64,
     pub max_disk_usage: Option<u64>,
+    /// Maximum bytes for a single pipe (None = unlimited).
+    pub max_pipe_size: Option<u64>,
     /// Seconds to keep an entry after PUT completes.
     pub put_ttl: u64,
     /// Seconds to keep an entry after first GET completes.

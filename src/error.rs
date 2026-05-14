@@ -20,6 +20,7 @@ pub enum PipeError {
     MultipartError(multer::Error),
     IoError(std::io::Error),
     UploadError(hyper::Error),
+    PipeTooLarge,
     #[cfg(feature = "forward")]
     ForwardError(String),
     ForwardDisabled,
@@ -45,6 +46,7 @@ impl PipeError {
             Self::Draining | Self::TooManyOpenFiles | Self::DiskFull | Self::DiskQuotaExceeded => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            Self::PipeTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             #[cfg(feature = "forward")]
             Self::ForwardError(_) => StatusCode::BAD_GATEWAY,
             Self::ForwardDisabled => StatusCode::FORBIDDEN,
@@ -70,6 +72,7 @@ impl PipeError {
             #[cfg(feature = "forward")]
             Self::ForwardError(e) => format!("forward failed: {e}"),
             Self::ForwardDisabled => "X-Forward-Url is disabled; start the server with --allow-forward to enable".into(),
+            Self::PipeTooLarge => "upload exceeds max pipe size".into(),
         }
     }
 

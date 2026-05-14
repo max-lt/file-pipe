@@ -64,6 +64,17 @@ async fn handle_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
+    // Early reject if the declared size already exceeds the per-pipe limit.
+    // Multipart inbound CL includes framing, so we only check raw uploads here;
+    // the running-total check in write_chunk catches multipart and chunked.
+    if boundary.is_none() {
+        if let (Some(max), Some(len)) = (state.max_pipe_size, content_length) {
+            if len > max {
+                return PipeError::PipeTooLarge.into_response();
+            }
+        }
+    }
+
     // For raw uploads, capture Content-Type if provided
     let raw_content_type = if boundary.is_none() {
         req.headers()
@@ -343,13 +354,23 @@ fn fail_upload(key: String, entry: Arc<PipeEntry>, state: Arc<AppState>) {
     schedule_cleanup(key, state, entry);
 }
 
-/// Write a chunk to the pipe's backing file, enforcing disk quota.
+/// Write a chunk to the pipe's backing file, enforcing per-pipe and disk quotas.
 async fn write_chunk(
     entry: &PipeEntry,
     state: &AppState,
     data: &[u8],
 ) -> Result<(), Response<BoxBody>> {
     let len = data.len() as u64;
+
+    // Per-pipe size limit (catches streaming uploads with no Content-Length,
+    // and multipart uploads where the inbound CL isn't meaningful).
+    if let Some(max) = state.max_pipe_size {
+        if entry.written.load(Ordering::Relaxed) + len > max {
+            entry.done.store(true, Ordering::Release);
+            entry.notify.notify_waiters();
+            return Err(PipeError::PipeTooLarge.into_response());
+        }
+    }
 
     // Reserve disk quota optimistically
     if let Some(max) = state.max_disk_usage {

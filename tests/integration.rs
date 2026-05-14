@@ -380,6 +380,82 @@ async fn disk_quota_enforced() {
 }
 
 #[tokio::test]
+async fn pipe_size_limit_rejects_oversize_content_length() {
+    // Raw PUT with Content-Length above the per-pipe cap is rejected up-front
+    // with 413, before any entry is created.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        max_pipe_size: Some(100),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let resp = client
+        .put(format!("{base}/too-big"))
+        .body("x".repeat(200))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 413);
+
+    // No entry should have been created — GET must time out.
+    let resp = client.get(format!("{base}/too-big")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn pipe_size_limit_aborts_oversize_streaming_upload() {
+    // Streaming body without Content-Length: the running-total check must
+    // abort the upload once it exceeds the per-pipe cap.
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        max_pipe_size: Some(150),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let base = base_url(&srv);
+    let base2 = base.clone();
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+
+    let put_handle = tokio::spawn(async move {
+        Client::new()
+            .put(format!("{base2}/stream-too-big"))
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+
+    body_tx.send(Ok(Bytes::from("A".repeat(100)))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    body_tx.send(Ok(Bytes::from("B".repeat(100)))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(body_tx);
+
+    let status = put_handle.await.unwrap();
+    assert_eq!(status, 413);
+
+    // A subsequent GET should not find any data once the entry is cleaned up.
+    // We can't strictly assert on timing here, but the upload must not have succeeded.
+    let resp = Client::new()
+        .get(format!("{base}/stream-too-big"))
+        .send()
+        .await
+        .unwrap();
+    // Reader sees the partial bytes that landed before the cap was hit,
+    // but the upload itself returned 413 — confirming the abort path worked.
+    assert!(resp.bytes().await.unwrap().len() <= 150);
+}
+
+#[tokio::test]
 async fn multipart_upload_preserves_filename_and_mime() {
     let srv = spawn_server().await;
     let base = base_url(&srv);
