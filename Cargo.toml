@@ -16,7 +16,11 @@ multer = "3.1.0"
 dashmap = "6.1.0"
 blake3 = "1"
 
-reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls"], optional = true }
+
+[features]
+default = []
+forward = ["dep:reqwest"]
 
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["stream", "multipart"] }

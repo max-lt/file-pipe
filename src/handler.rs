@@ -81,7 +81,12 @@ async fn handle_put(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    if forward_url.is_some() && !state.allow_forward {
+    #[cfg(feature = "forward")]
+    let forward_blocked = forward_url.is_some() && !state.allow_forward;
+    #[cfg(not(feature = "forward"))]
+    let forward_blocked = forward_url.is_some();
+
+    if forward_blocked {
         return PipeError::ForwardDisabled.into_response();
     }
 
@@ -132,6 +137,7 @@ async fn handle_put(
     }
 
     // Set up forward channel if a forward URL was provided
+    #[cfg(feature = "forward")]
     let (forward_tx, forward_task) = if let Some(url) = forward_url {
         eprintln!("[PUT] key={key} forwarding to {url}");
         let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
@@ -151,6 +157,9 @@ async fn handle_put(
         (None, None)
     };
 
+    #[cfg(not(feature = "forward"))]
+    let forward_tx: Option<tokio::sync::mpsc::Sender<Bytes>> = None;
+
     eprintln!("[PUT] key={key} upload started");
 
     let resp = if let Some(boundary) = boundary {
@@ -165,6 +174,7 @@ async fn handle_put(
     }
 
     // Check forward result
+    #[cfg(feature = "forward")]
     if let Some(task) = forward_task {
         match task.await {
             Ok(Ok(r)) if r.status().is_success() => {

@@ -44,6 +44,7 @@ pub struct AppState {
     /// Seconds a GET waits for a missing key before returning 404.
     pub get_wait_timeout: u64,
     /// Allow X-Forward-Url to tee uploads to an external URL.
+    #[cfg(feature = "forward")]
     pub allow_forward: bool,
 }
 

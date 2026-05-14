@@ -14,6 +14,7 @@ async fn spawn_server() -> file_pipe::ServerHandle {
     .unwrap()
 }
 
+#[cfg(feature = "forward")]
 async fn spawn_server_with_forward() -> file_pipe::ServerHandle {
     file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
@@ -643,6 +644,7 @@ async fn reader_survives_long_streaming_upload() {
 
 // --- Forward upload to external URL via X-Forward-Url ---
 
+#[cfg(feature = "forward")]
 #[tokio::test]
 async fn forward_upload_to_external_url() {
     // Use a second file-pipe instance as the "S3" target.
@@ -685,6 +687,7 @@ async fn forward_upload_to_external_url() {
     assert_eq!(resp.text().await.unwrap(), "hello from forward");
 }
 
+#[cfg(feature = "forward")]
 #[tokio::test]
 async fn forward_upload_bad_url_returns_502() {
     let srv = spawn_server_with_forward().await;
@@ -702,6 +705,7 @@ async fn forward_upload_bad_url_returns_502() {
     assert_eq!(resp.status(), 502);
 }
 
+#[cfg(feature = "forward")]
 #[tokio::test]
 async fn forward_streaming_upload() {
     // Stream data through with forward — both local and target get everything

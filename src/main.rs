@@ -31,6 +31,7 @@ struct Args {
 
     /// Allow X-Forward-Url to tee uploads to an external URL.
     /// SSRF risk if the server is exposed to untrusted clients.
+    #[cfg(feature = "forward")]
     #[arg(long, env = "ALLOW_FORWARD")]
     allow_forward: bool,
 }
@@ -64,6 +65,7 @@ async fn main() {
         put_ttl: args.put_ttl,
         get_ttl: args.get_ttl,
         get_wait_timeout: args.get_wait_timeout,
+        #[cfg(feature = "forward")]
         allow_forward: args.allow_forward,
     };
 

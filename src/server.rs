@@ -23,6 +23,7 @@ pub struct ServerConfig {
     pub get_wait_timeout: u64,
     /// Allow X-Forward-Url to tee uploads to an external URL (default: false).
     /// SSRF risk if the server is exposed to untrusted clients.
+    #[cfg(feature = "forward")]
     pub allow_forward: bool,
 }
 
@@ -35,6 +36,7 @@ impl Default for ServerConfig {
             put_ttl: 30,
             get_ttl: 5,
             get_wait_timeout: 5,
+            #[cfg(feature = "forward")]
             allow_forward: false,
         }
     }
@@ -104,6 +106,7 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
         put_ttl: config.put_ttl,
         get_ttl: config.get_ttl,
         get_wait_timeout: config.get_wait_timeout,
+        #[cfg(feature = "forward")]
         allow_forward: config.allow_forward,
     });
 
