@@ -14,6 +14,16 @@ async fn spawn_server() -> file_pipe::ServerHandle {
     .unwrap()
 }
 
+async fn spawn_server_with_forward() -> file_pipe::ServerHandle {
+    file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        allow_forward: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+
 fn base_url(handle: &file_pipe::ServerHandle) -> String {
     format!("http://{}", handle.addr)
 }
@@ -639,7 +649,7 @@ async fn forward_upload_to_external_url() {
     let target_srv = spawn_server().await;
     let target_base = base_url(&target_srv);
 
-    let srv = spawn_server().await;
+    let srv = spawn_server_with_forward().await;
     let base = base_url(&srv);
     let client = Client::new();
 
@@ -677,7 +687,7 @@ async fn forward_upload_to_external_url() {
 
 #[tokio::test]
 async fn forward_upload_bad_url_returns_502() {
-    let srv = spawn_server().await;
+    let srv = spawn_server_with_forward().await;
     let base = base_url(&srv);
     let client = Client::new();
 
@@ -698,7 +708,7 @@ async fn forward_streaming_upload() {
     let target_srv = spawn_server().await;
     let target_base = base_url(&target_srv);
 
-    let srv = spawn_server().await;
+    let srv = spawn_server_with_forward().await;
     let base = base_url(&srv);
     let base2 = base.clone();
 
@@ -740,6 +750,29 @@ async fn forward_streaming_upload() {
         .unwrap();
 
     assert_eq!(resp.text().await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn forward_disabled_by_default_returns_403() {
+    // Default server has allow_forward=false; X-Forward-Url must be rejected
+    // before any pipe entry is created.
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let resp = client
+        .put(format!("{base}/blocked"))
+        .header("x-forward-url", "http://example.invalid/anything")
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+
+    // A subsequent GET for the same key must time out — no entry should have been created.
+    let resp = client.get(format!("{base}/blocked")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 // --- Second GET after spill must read complete data from disk ---

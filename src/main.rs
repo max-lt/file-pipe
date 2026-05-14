@@ -28,6 +28,11 @@ struct Args {
     /// Seconds a GET waits for a missing key before returning 404 (default: 5)
     #[arg(long, default_value_t = 5, env = "GET_WAIT_TIMEOUT")]
     get_wait_timeout: u64,
+
+    /// Allow X-Forward-Url to tee uploads to an external URL.
+    /// SSRF risk if the server is exposed to untrusted clients.
+    #[arg(long, env = "ALLOW_FORWARD")]
+    allow_forward: bool,
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -59,6 +64,7 @@ async fn main() {
         put_ttl: args.put_ttl,
         get_ttl: args.get_ttl,
         get_wait_timeout: args.get_wait_timeout,
+        allow_forward: args.allow_forward,
     };
 
     if let Some(max) = config.max_disk_usage {

@@ -21,6 +21,7 @@ pub enum PipeError {
     IoError(std::io::Error),
     UploadError(hyper::Error),
     ForwardError(String),
+    ForwardDisabled,
 }
 
 impl PipeError {
@@ -44,6 +45,7 @@ impl PipeError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             Self::ForwardError(_) => StatusCode::BAD_GATEWAY,
+            Self::ForwardDisabled => StatusCode::FORBIDDEN,
             Self::IoError(_) | Self::UploadError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -64,6 +66,7 @@ impl PipeError {
             Self::IoError(e) => format!("internal error: {e}"),
             Self::UploadError(e) => format!("upload failed: {e}"),
             Self::ForwardError(e) => format!("forward failed: {e}"),
+            Self::ForwardDisabled => "X-Forward-Url is disabled; start the server with --allow-forward to enable".into(),
         }
     }
 

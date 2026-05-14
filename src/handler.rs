@@ -81,6 +81,10 @@ async fn handle_put(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
+    if forward_url.is_some() && !state.allow_forward {
+        return PipeError::ForwardDisabled.into_response();
+    }
+
     // BLAKE3 hash of the key to avoid collisions (e.g. "a/b" vs "a_b").
     let file_path = state.data_dir.join(format!(
         "pipe-{}-{}",

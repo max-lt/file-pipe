@@ -43,6 +43,8 @@ pub struct AppState {
     pub get_ttl: u64,
     /// Seconds a GET waits for a missing key before returning 404.
     pub get_wait_timeout: u64,
+    /// Allow X-Forward-Url to tee uploads to an external URL.
+    pub allow_forward: bool,
 }
 
 /// Remove a key's entry only if it is the exact same Arc (pointer equality).
