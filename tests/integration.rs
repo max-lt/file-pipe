@@ -715,6 +715,7 @@ async fn forward_streaming_upload() {
     let srv = spawn_server_with_forward().await;
     let base = base_url(&srv);
     let base2 = base.clone();
+    let target_base2 = target_base.clone();
 
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(16);
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
@@ -722,7 +723,7 @@ async fn forward_streaming_upload() {
     let put_handle = tokio::spawn(async move {
         Client::new()
             .put(format!("{base2}/fwd-stream"))
-            .header("x-forward-url", format!("{target_base}/fwd-stream"))
+            .header("x-forward-url", format!("{target_base2}/fwd-stream"))
             .body(reqwest::Body::wrap_stream(body_stream))
             .send()
             .await
@@ -749,6 +750,15 @@ async fn forward_streaming_upload() {
     // Local pipe
     let resp = Client::new()
         .get(format!("{base}/fwd-stream"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.text().await.unwrap(), expected);
+
+    // Target server must have received the full forwarded body
+    let resp = Client::new()
+        .get(format!("{target_base}/fwd-stream"))
         .send()
         .await
         .unwrap();
