@@ -8,6 +8,8 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+use tracing::{error, info, warn};
+
 use crate::handler::handle;
 use crate::state::AppState;
 
@@ -90,10 +92,10 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
                 .is_some_and(|n| n.starts_with("pipe-"))
             {
                 let path = entry.path();
-                eprintln!("[STARTUP] removing orphaned file: {}", path.display());
+                info!("removing orphaned file: {}", path.display());
 
                 if let Err(e) = std::fs::remove_file(&path) {
-                    eprintln!("[STARTUP] failed to remove {}: {e}", path.display());
+                    warn!("failed to remove {}: {e}", path.display());
                 }
             }
         }
@@ -124,7 +126,7 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
             let (stream, remote) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    eprintln!("[ERROR] accept failed: {e}");
+                    error!("accept failed: {e}");
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     continue;
                 }
@@ -146,7 +148,7 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
                     .serve_connection(io, service)
                     .await
                 {
-                    eprintln!("[ERROR] {remote}: {e}");
+                    warn!("connection error from {remote}: {e}");
                 }
             });
         }

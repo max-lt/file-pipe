@@ -78,7 +78,7 @@ impl PipeError {
 
     pub fn into_response(self) -> Response<BoxBody> {
         let body = self.message();
-        eprintln!("[ERROR] {} {}", self.status().as_u16(), body);
+        tracing::warn!("{} {}", self.status().as_u16(), body);
 
         Response::builder()
             .status(self.status())

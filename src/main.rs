@@ -1,6 +1,8 @@
 use clap::Parser;
 use file_pipe::ServerConfig;
 use std::path::PathBuf;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(about = "HTTP pipe service — stream uploads to downloads in real-time")]
@@ -62,6 +64,10 @@ fn parse_size(s: &str) -> Result<u64, String> {
 async fn main() {
     let args = Args::parse();
 
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .init();
+
     let config = ServerConfig {
         addr: args.listen,
         data_dir: PathBuf::from(args.data_dir),
@@ -75,25 +81,25 @@ async fn main() {
     };
 
     if let Some(max) = config.max_disk_usage {
-        eprintln!("max disk usage: {}", format_size(max));
+        info!("max disk usage: {}", format_size(max));
     }
 
     if let Some(max) = config.max_pipe_size {
-        eprintln!("max pipe size: {}", format_size(max));
+        info!("max pipe size: {}", format_size(max));
     }
 
     let handle = file_pipe::start_server(config).await.unwrap_or_else(|e| {
-        eprintln!("failed to start server: {e}");
+        error!("failed to start server: {e}");
         std::process::exit(1);
     });
-    eprintln!("file-pipe listening on {}", handle.addr);
+    info!("file-pipe listening on {}", handle.addr);
 
     wait_for_signal().await;
-    eprintln!("[SHUTDOWN] draining - no new uploads accepted");
+    info!("draining - no new uploads accepted");
     handle.drain();
 
     wait_for_signal().await;
-    eprintln!("[SHUTDOWN] cleaning up and exiting");
+    info!("cleaning up and exiting");
     handle.cleanup().await;
     std::process::exit(0);
 }

@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex, Notify};
+use tracing::{debug, warn};
 
 /// Metadata behind a mutex — only accessed for first GET, not on the hot path.
 pub struct PipeMetadata {
@@ -69,9 +70,9 @@ pub(crate) async fn free_entry(state: &AppState, key: &str, entry: &PipeEntry) {
 
     if let Err(e) = crate::io::remove(&entry.path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("[CLEANUP] key={key} failed to remove file: {e}");
+            warn!("cleanup key={key} failed to remove file: {e}");
         }
     }
 
-    eprintln!("[CLEANUP] key={key} removed ({written} bytes freed)");
+    debug!("cleanup key={key} removed ({written} bytes freed)");
 }

@@ -9,6 +9,7 @@ use hyper::body::{Frame, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::{error, info};
 
 use crate::error::{BoxBody, PipeError, ok_response};
 use crate::state::{AppState, PipeEntry, PipeMetadata, cleanup_entry};
@@ -150,7 +151,7 @@ async fn handle_put(
     // Set up forward channel if a forward URL was provided
     #[cfg(feature = "forward")]
     let (forward_tx, forward_task) = if let Some(url) = forward_url {
-        eprintln!("[PUT] key={key} forwarding to {url}");
+        info!("PUT key={key} forwarding to {url}");
         let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
         let body_stream = tokio_stream::StreamExt::map(
             ReceiverStream::new(rx),
@@ -180,7 +181,7 @@ async fn handle_put(
     #[cfg(not(feature = "forward"))]
     let forward_tx: Option<tokio::sync::mpsc::Sender<Bytes>> = None;
 
-    eprintln!("[PUT] key={key} upload started");
+    info!("PUT key={key} upload started");
 
     let resp = if let Some(boundary) = boundary {
         stream_multipart(key, req.into_body(), boundary, entry, state, forward_tx).await
@@ -198,7 +199,7 @@ async fn handle_put(
     if let Some(task) = forward_task {
         match task.await {
             Ok(Ok(r)) if r.status().is_success() => {
-                eprintln!("[FORWARD] success ({})", r.status());
+                info!("FORWARD success ({})", r.status());
             }
             Ok(Ok(r)) => {
                 let status = r.status();
@@ -294,8 +295,8 @@ async fn stream_multipart(
         meta.content_length = None;
     }
 
-    eprintln!(
-        "[PUT] key={key} multipart file={:?} type={:?}",
+    info!(
+        "PUT key={key} multipart file={:?} type={:?}",
         field.file_name().map(String::from),
         field.content_type().map(|m| m.to_string()),
     );
@@ -337,7 +338,7 @@ async fn finalize_upload(key: &str, entry: &PipeEntry) {
     entry.meta.lock().await.upload_ended_at = Some(Instant::now());
     entry.done.store(true, Ordering::Release);
     entry.notify.notify_waiters();
-    eprintln!("[PUT] key={key} upload complete: {total_bytes} bytes");
+    info!("PUT key={key} upload complete: {total_bytes} bytes");
 }
 
 fn schedule_cleanup(key: String, state: Arc<AppState>, entry: Arc<PipeEntry>) {
@@ -500,7 +501,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
         }
 
         meta.last_get_at = Some(now);
-        eprintln!("[GET] key={key}");
+        info!("GET key={key}");
         (meta.content_length, meta.mime_type.clone(), meta.filename.clone())
     };
 
@@ -522,7 +523,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
                 let mut file = match file_guard.as_ref().and_then(|f| f.try_clone().ok()) {
                     Some(f) => f,
                     None => {
-                        eprintln!("[GET] failed to clone file handle");
+                        error!("GET failed to clone file handle");
                         return;
                     }
                 };
@@ -542,7 +543,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
                         }
                         Ok(_) => break,
                         Err(e) => {
-                            eprintln!("[GET] read error: {e}");
+                            error!("GET read error: {e}");
                             return;
                         }
                     }
