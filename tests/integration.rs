@@ -882,6 +882,27 @@ async fn forward_propagates_content_length_for_raw_upload() {
 }
 
 #[tokio::test]
+async fn forward_url_with_invalid_scheme_returns_400() {
+    // Validation happens before the feature gate / allow-forward check,
+    // so file:// (and other junk) is rejected even on a default server.
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    for bad in &["file:///etc/passwd", "ftp://example.com/x", "not-a-url"] {
+        let resp = client
+            .put(format!("{base}/bad"))
+            .header("x-forward-url", *bad)
+            .body("payload")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400, "url={bad}");
+    }
+}
+
+#[tokio::test]
 async fn forward_disabled_by_default_returns_403() {
     // Default server has allow_forward=false; X-Forward-Url must be rejected
     // before any pipe entry is created.

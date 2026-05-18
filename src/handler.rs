@@ -93,6 +93,14 @@ async fn handle_put(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
+    // Reject anything that isn't an http(s) URL up-front. Rules out file://,
+    // junk values, and reduces SSRF surface even when the feature is enabled.
+    if let Some(ref url) = forward_url {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return PipeError::ForwardInvalidUrl.into_response();
+        }
+    }
+
     #[cfg(feature = "forward")]
     let forward_blocked = forward_url.is_some() && !state.allow_forward;
     #[cfg(not(feature = "forward"))]

@@ -24,6 +24,7 @@ pub enum PipeError {
     #[cfg(feature = "forward")]
     ForwardError(String),
     ForwardDisabled,
+    ForwardInvalidUrl,
 }
 
 impl PipeError {
@@ -37,7 +38,7 @@ impl PipeError {
 
     fn status(&self) -> StatusCode {
         match self {
-            Self::EmptyKey | Self::KeyTooLong => StatusCode::BAD_REQUEST,
+            Self::EmptyKey | Self::KeyTooLong | Self::ForwardInvalidUrl => StatusCode::BAD_REQUEST,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::KeyAlreadyExists => StatusCode::CONFLICT,
             Self::KeyNotFound => StatusCode::NOT_FOUND,
@@ -72,6 +73,7 @@ impl PipeError {
             #[cfg(feature = "forward")]
             Self::ForwardError(e) => format!("forward failed: {e}"),
             Self::ForwardDisabled => "X-Forward-Url is disabled; start the server with --allow-forward to enable".into(),
+            Self::ForwardInvalidUrl => "X-Forward-Url must be an http:// or https:// URL".into(),
             Self::PipeTooLarge => "upload exceeds max pipe size".into(),
         }
     }
