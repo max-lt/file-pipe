@@ -39,6 +39,7 @@ All options can be set via CLI flags or environment variables. CLI flags take pr
 | `--get-ttl`             | `GET_TTL`           | `5`            | Seconds to keep an entry after first GET completes |
 | `--get-wait-timeout`    | `GET_WAIT_TIMEOUT`  | `5`            | Seconds a GET waits for a missing key (404 after) |
 | `--allow-forward`       | `ALLOW_FORWARD`     | off            | Enable `X-Forward-Url` tee (requires `forward` feature) |
+| `--metrics-addr`        | `METRICS_ADDR`      | off            | Bind a separate listener exposing `/health` and `/metrics` |
 
 ## Forwarding (optional)
 
@@ -76,6 +77,19 @@ cargo build --release                    # default — no forwarding
 cargo build --release --features forward # with X-Forward-Url support
 cargo test                                # default tests
 cargo test --features forward             # also runs the forward tests
+```
+
+## Health & metrics
+
+Pass `--metrics-addr 127.0.0.1:9090` to expose two endpoints on a second listener (off by default). Keep it bound to localhost or a private interface — there's no auth.
+
+```
+GET /health   → 200 "ok"
+GET /metrics  → 200 plain text:
+                pipes 5
+                disk_usage 1048576
+                key_waiters 2
+                draining 0
 ```
 
 ## Logging

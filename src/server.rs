@@ -1,15 +1,21 @@
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use bytes::Bytes;
 use dashmap::DashMap;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use tracing::{error, info, warn};
 
+use crate::error::BoxBody;
 use crate::handler::handle;
 use crate::state::AppState;
 
@@ -29,6 +35,8 @@ pub struct ServerConfig {
     /// SSRF risk if the server is exposed to untrusted clients.
     #[cfg(feature = "forward")]
     pub allow_forward: bool,
+    /// Optional separate listener exposing /health and /metrics (default: off).
+    pub metrics_addr: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -43,12 +51,14 @@ impl Default for ServerConfig {
             get_wait_timeout: 5,
             #[cfg(feature = "forward")]
             allow_forward: false,
+            metrics_addr: None,
         }
     }
 }
 
 pub struct ServerHandle {
     pub addr: SocketAddr,
+    pub metrics_addr: Option<SocketAddr>,
     state: Arc<AppState>,
 }
 
@@ -154,8 +164,74 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
         }
     });
 
+    // Optional metrics listener on a separate address
+    let metrics_local_addr = if let Some(metrics_addr) = config.metrics_addr {
+        let metrics_listener = TcpListener::bind(&metrics_addr).await?;
+        let local = metrics_listener.local_addr()?;
+        info!("metrics listening on {}", local);
+
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match metrics_listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!("metrics accept failed: {e}");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let state = state_clone.clone();
+
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let service = service_fn(move |req| {
+                        let state = state.clone();
+                        async move { Ok::<_, Infallible>(metrics_handle(req, &state)) }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        });
+        Some(local)
+    } else {
+        None
+    };
+
     Ok(ServerHandle {
         addr: local_addr,
+        metrics_addr: metrics_local_addr,
         state,
     })
+}
+
+fn metrics_handle(req: Request<Incoming>, state: &AppState) -> Response<BoxBody> {
+    let (status, body) = match (req.method(), req.uri().path()) {
+        (&Method::GET, "/health") => (StatusCode::OK, "ok\n".to_string()),
+        (&Method::GET, "/metrics") => {
+            let pipes = state.pipes.len();
+            let disk_usage = state.disk_usage.load(Ordering::Relaxed);
+            let key_waiters = state.key_waiters.len();
+            let draining = state.draining.load(Ordering::Relaxed) as u8;
+            (
+                StatusCode::OK,
+                format!(
+                    "pipes {pipes}\ndisk_usage {disk_usage}\nkey_waiters {key_waiters}\ndraining {draining}\n"
+                ),
+            )
+        }
+        _ => (StatusCode::NOT_FOUND, "not found\n".to_string()),
+    };
+
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/plain")
+        .body(
+            Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
 }

@@ -40,6 +40,11 @@ struct Args {
     #[cfg(feature = "forward")]
     #[arg(long, env = "ALLOW_FORWARD")]
     allow_forward: bool,
+
+    /// Optional separate listener exposing /health and /metrics.
+    /// Bind to localhost (e.g. 127.0.0.1:9090) to keep stats off the data plane.
+    #[arg(long, env = "METRICS_ADDR")]
+    metrics_addr: Option<String>,
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -78,6 +83,7 @@ async fn main() {
         get_wait_timeout: args.get_wait_timeout,
         #[cfg(feature = "forward")]
         allow_forward: args.allow_forward,
+        metrics_addr: args.metrics_addr,
     };
 
     if let Some(max) = config.max_disk_usage {

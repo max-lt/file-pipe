@@ -900,6 +900,51 @@ async fn forward_propagates_content_length_for_raw_upload() {
 }
 
 #[tokio::test]
+async fn health_and_metrics_endpoints() {
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
+        metrics_addr: Some("127.0.0.1:0".into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let data_base = format!("http://{}", srv.addr);
+    let metrics_base = format!("http://{}", srv.metrics_addr.unwrap());
+    let client = Client::new();
+
+    // /health → 200 ok
+    let resp = client.get(format!("{metrics_base}/health")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "ok\n");
+
+    // /metrics with no pipes → pipes 0
+    let resp = client.get(format!("{metrics_base}/metrics")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("pipes 0"), "body was: {body}");
+    assert!(body.contains("disk_usage 0"), "body was: {body}");
+    assert!(body.contains("draining 0"), "body was: {body}");
+
+    // Upload, then /metrics should report 1 pipe
+    client.put(format!("{data_base}/k")).body("hi").send().await.unwrap();
+
+    let resp = client.get(format!("{metrics_base}/metrics")).send().await.unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("pipes 1"), "body was: {body}");
+
+    // Data plane should NOT serve /health
+    let resp = client.get(format!("{data_base}/health")).send().await.unwrap();
+    // /health on the data plane is treated as a key — and the key doesn't exist
+    assert_eq!(resp.status(), 404);
+
+    // Unknown path on the metrics listener → 404
+    let resp = client.get(format!("{metrics_base}/nope")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
 async fn forward_url_with_invalid_scheme_returns_400() {
     // Validation happens before the feature gate / allow-forward check,
     // so file:// (and other junk) is rejected even on a default server.
