@@ -27,3 +27,4 @@ forward = ["dep:reqwest"]
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["stream", "multipart"] }
 futures = "0.3"
+tempfile = "3"

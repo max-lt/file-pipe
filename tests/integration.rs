@@ -5,9 +5,21 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::Duration;
 
+// Each test gets a unique data_dir so concurrent tests can't clobber each
+// other's pipe-* files via the startup orphan-cleanup sweep. The TempDir
+// is leaked on purpose: the cargo test process is short-lived and the OS
+// reclaims /tmp; this avoids threading TempDir lifetimes through every test.
+fn fresh_data_dir() -> std::path::PathBuf {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    path
+}
+
 async fn spawn_server() -> file_pipe::ServerHandle {
     file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         ..Default::default()
     })
     .await
@@ -18,6 +30,7 @@ async fn spawn_server() -> file_pipe::ServerHandle {
 async fn spawn_server_with_forward() -> file_pipe::ServerHandle {
     file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         allow_forward: true,
         ..Default::default()
     })
@@ -349,6 +362,7 @@ async fn drain_rejects_new_puts() {
 async fn disk_quota_enforced() {
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         max_disk_usage: Some(100),
         ..Default::default()
     })
@@ -385,6 +399,7 @@ async fn pipe_size_limit_rejects_oversize_content_length() {
     // with 413, before any entry is created.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         max_pipe_size: Some(100),
         ..Default::default()
     })
@@ -413,6 +428,7 @@ async fn pipe_size_limit_aborts_oversize_streaming_upload() {
     // abort the upload once it exceeds the per-pipe cap.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         max_pipe_size: Some(150),
         ..Default::default()
     })
@@ -557,6 +573,7 @@ async fn keys_with_slash_vs_underscore_dont_collide() {
     // Both should store and return their own data independently.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         ..Default::default()
     })
     .await
@@ -644,6 +661,7 @@ async fn reader_survives_long_streaming_upload() {
     // the writer trickles many small chunks.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         ..Default::default()
     })
     .await
@@ -933,6 +951,7 @@ async fn second_reader_mid_stream_gets_full_data() {
     // upload is still in progress. Both must receive all the data.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         ..Default::default()
     })
     .await
@@ -1105,6 +1124,7 @@ async fn multiple_readers_during_active_streaming() {
 async fn large_file_integrity() {
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         ..Default::default()
     })
     .await
@@ -1430,6 +1450,7 @@ async fn concurrent_readers_streaming_stress() {
     // Catches races between the reader's `written` load and the data path.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         ..Default::default()
     })
     .await
@@ -1635,6 +1656,7 @@ async fn disk_quota_exceeded_during_streaming() {
     // The reader should receive whatever was written before the quota hit.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         max_disk_usage: Some(200),
         ..Default::default()
     })
@@ -1886,6 +1908,7 @@ async fn binary_data_integrity_all_byte_values() {
     // Ensure all 256 byte values survive the roundtrip without corruption.
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         ..Default::default()
     })
     .await
@@ -1936,6 +1959,7 @@ async fn binary_data_integrity_all_byte_values() {
 async fn multipart_large_file_integrity() {
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
         ..Default::default()
     })
     .await
