@@ -29,15 +29,32 @@ The original filename and content type are forwarded to readers via `Content-Dis
 
 All options can be set via CLI flags or environment variables. CLI flags take precedence.
 
-| Flag                    | Env var           | Default        | Description                              |
-| ----------------------- | ----------------- | -------------- | ---------------------------------------- |
-| `-l, --listen`          | `LISTEN`          | `0.0.0.0:3000` | Address to listen on                     |
-| `-d, --data-dir`        | `DATA_DIR`        | `$TMPDIR`      | Directory for temporary files            |
-| `-M, --max-memory`      | `MAX_MEMORY`      | unlimited      | Maximum memory usage (e.g. `256M`, `1G`) |
-| `-D, --max-disk`        | `MAX_DISK`        | unlimited      | Maximum disk usage (e.g. `1G`, `500M`)   |
-| `-s, --spill-threshold` | `SPILL_THRESHOLD` | `1M`           | Files smaller than this stay in memory   |
+| Flag                    | Env var             | Default        | Description                                       |
+| ----------------------- | ------------------- | -------------- | ------------------------------------------------- |
+| `-l, --listen`          | `LISTEN`            | `0.0.0.0:3000` | Address to listen on                              |
+| `-d, --data-dir`        | `DATA_DIR`          | `$TMPDIR`      | Directory for temporary files                     |
+| `-D, --max-disk`        | `MAX_DISK`          | unlimited      | Maximum total disk usage (e.g. `1G`, `500M`)      |
+| `-P, --max-pipe-size`   | `MAX_PIPE_SIZE`     | unlimited      | Maximum bytes for a single pipe                   |
+| `--put-ttl`             | `PUT_TTL`           | `30`           | Seconds to keep an entry after PUT completes      |
+| `--get-ttl`             | `GET_TTL`           | `5`            | Seconds to keep an entry after first GET completes |
+| `--get-wait-timeout`    | `GET_WAIT_TIMEOUT`  | `5`            | Seconds a GET waits for a missing key (404 after) |
+| `--allow-forward`       | `ALLOW_FORWARD`     | off            | Enable `X-Forward-Url` tee (requires `forward` feature) |
 
-Small files stay in memory for fast streaming. When a file exceeds the spill threshold or memory is full, data spills to disk transparently.
+## Forwarding (optional)
+
+Built behind the `forward` Cargo feature (off by default). When enabled at build time **and** `--allow-forward` is set at runtime, clients can supply an `X-Forward-Url` header to tee the upload to an external URL while it streams through file-pipe:
+
+```bash
+cargo build --release --features forward
+
+curl -T file.bin \
+  -H "X-Forward-Url: https://example.s3.amazonaws.com/upload?X-Amz-..." \
+  http://localhost:3000/mykey
+```
+
+For raw uploads with a known `Content-Length`, file-pipe forwards the header to the upstream — works with S3 presigned PUTs that sign a fixed size.
+
+The feature is off by default because it brings in `reqwest` + `rustls`, which roughly triples the release binary size.
 
 ## Docker
 
@@ -55,15 +72,26 @@ docker run -p 3000:3000 -v /tmp/pipe-data:/data file-pipe
 ## Build
 
 ```bash
-cargo build --release
-cargo test
+cargo build --release                    # default — no forwarding
+cargo build --release --features forward # with X-Forward-Url support
+cargo test                                # default tests
+cargo test --features forward             # also runs the forward tests
+```
+
+## Logging
+
+Output goes through `tracing`. Set `RUST_LOG` to control verbosity:
+
+```bash
+RUST_LOG=warn  file-pipe   # only warnings + errors
+RUST_LOG=debug file-pipe   # routine cleanup traces
 ```
 
 ## Architecture
 
-- **Hybrid storage**: small files in memory, large files on disk with automatic spill
-- **Real-time streaming**: readers receive data as the writer sends it (no buffering the full upload)
-- **Concurrent readers**: multiple GETs on the same key stream data independently
-- **Lock-free hot path**: atomics for writer/reader synchronization, `DashMap` for sharded key lookups
-- **Async I/O**: `pread`/`pwrite` via `spawn_blocking` for position-independent concurrent file access
-- **Graceful shutdown**: first signal drains (rejects new uploads), second signal cleans up and exits
+- **Disk-backed storage**: every upload is written through `pwrite` to a temp file. The OS page cache keeps hot data resident in RAM for short-lived pipes; the kernel handles eviction.
+- **Real-time streaming**: readers receive data as the writer sends it (no buffering the full upload).
+- **Concurrent readers**: multiple GETs on the same key stream data independently via `pread`.
+- **Lock-free hot path**: atomics for writer/reader synchronization, `DashMap` for sharded key lookups.
+- **Async I/O**: `pread`/`pwrite` via `spawn_blocking` for position-independent concurrent file access.
+- **Graceful shutdown**: first signal drains (rejects new uploads), second signal cleans up and exits.
