@@ -5,7 +5,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(about = "HTTP pipe service — stream uploads to downloads in real-time")]
+#[command(version, about = "HTTP pipe service — stream uploads to downloads in real-time")]
 struct Args {
     /// Address to listen on
     #[arg(short, long, default_value = "0.0.0.0:3000", env = "LISTEN")]
