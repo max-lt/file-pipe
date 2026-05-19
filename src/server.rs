@@ -65,6 +65,11 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// Number of active pipe entries (uploads in flight or held for the TTL window).
+    pub fn pipes_count(&self) -> usize {
+        self.state.pipes.len()
+    }
+
     /// Number of pending key waiters (GETs waiting for a non-existent key).
     pub fn key_waiters_count(&self) -> usize {
         self.state.key_waiters.len()

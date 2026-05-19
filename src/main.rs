@@ -104,10 +104,24 @@ async fn main() {
     info!("draining - no new uploads accepted");
     handle.drain();
 
-    wait_for_signal().await;
-    info!("cleaning up and exiting");
+    // Wait for all entries to drain, or for a second signal to force exit.
+    tokio::select! {
+        _ = wait_until_drained(&handle) => {
+            info!("drain complete, exiting");
+        }
+        _ = wait_for_signal() => {
+            info!("force shutdown, cleaning up");
+        }
+    }
+
     handle.cleanup().await;
     std::process::exit(0);
+}
+
+async fn wait_until_drained(handle: &file_pipe::ServerHandle) {
+    while handle.pipes_count() > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 fn format_size(bytes: u64) -> String {

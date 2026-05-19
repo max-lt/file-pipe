@@ -108,4 +108,4 @@ RUST_LOG=debug file-pipe   # routine cleanup traces
 - **Concurrent readers**: multiple GETs on the same key stream data independently via `pread`.
 - **Lock-free hot path**: atomics for writer/reader synchronization, `DashMap` for sharded key lookups.
 - **Async I/O**: `pread`/`pwrite` via `spawn_blocking` for position-independent concurrent file access.
-- **Graceful shutdown**: first signal drains (rejects new uploads), second signal cleans up and exits.
+- **Graceful shutdown**: first signal drains (rejects new uploads) and waits for in-flight pipes to be cleaned up by their TTLs; second signal forces immediate cleanup and exit.
