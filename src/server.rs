@@ -13,11 +13,13 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use crate::error::BoxBody;
 use crate::handler::handle;
 use crate::state::AppState;
+
+static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(0);
 
 pub struct ServerConfig {
     pub addr: String,
@@ -148,7 +150,9 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
 
                 let service = service_fn(move |req| {
                     let state = state.clone();
-                    handle(req, state)
+                    let id = NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed);
+                    let span = tracing::info_span!("req", id);
+                    handle(req, state).instrument(span)
                 });
 
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
