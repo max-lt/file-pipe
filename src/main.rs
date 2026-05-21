@@ -5,7 +5,10 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(version, about = "HTTP pipe service — stream uploads to downloads in real-time")]
+#[command(
+    version,
+    about = "HTTP pipe service — stream uploads to downloads in real-time"
+)]
 struct Args {
     /// Address to listen on
     #[arg(short, long, default_value = "0.0.0.0:3000", env = "LISTEN")]
@@ -67,7 +70,10 @@ fn parse_size(s: &str) -> Result<u64, String> {
     num.trim()
         .parse::<u64>()
         .map_err(|e| format!("invalid size: {e}"))
-        .and_then(|n| n.checked_mul(mult).ok_or_else(|| format!("size too large: {s}")))
+        .and_then(|n| {
+            n.checked_mul(mult)
+                .ok_or_else(|| format!("size too large: {s}"))
+        })
 }
 
 #[tokio::main]
@@ -75,7 +81,9 @@ async fn main() {
     let args = Args::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let config = ServerConfig {

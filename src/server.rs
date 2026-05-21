@@ -93,12 +93,7 @@ impl ServerHandle {
 
     /// Remove all temp files for active pipes.
     pub async fn cleanup(&self) {
-        let keys: Vec<String> = self
-            .state
-            .pipes
-            .iter()
-            .map(|r| r.key().clone())
-            .collect();
+        let keys: Vec<String> = self.state.pipes.iter().map(|r| r.key().clone()).collect();
 
         for key in &keys {
             if let Some((_, entry)) = self.state.pipes.remove(key) {

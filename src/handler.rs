@@ -16,7 +16,11 @@ use crate::state::{AppState, DownloadGuard, PipeEntry, PipeMetadata, UploadGuard
 
 /// Extract the multipart boundary from Content-Type, if present.
 fn multipart_boundary(req: &Request<Incoming>) -> Option<String> {
-    let ct = req.headers().get(hyper::header::CONTENT_TYPE)?.to_str().ok()?;
+    let ct = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?;
 
     if !ct.starts_with("multipart/form-data") {
         return None;
@@ -68,12 +72,11 @@ async fn handle_put(
     // Early reject if the declared size already exceeds the per-pipe limit.
     // Multipart inbound CL includes framing, so we only check raw uploads here;
     // the running-total check in write_chunk catches multipart and chunked.
-    if boundary.is_none() {
-        if let (Some(max), Some(len)) = (state.max_pipe_size, content_length) {
-            if len > max {
-                return PipeError::PipeTooLarge.into_response();
-            }
-        }
+    if boundary.is_none()
+        && let (Some(max), Some(len)) = (state.max_pipe_size, content_length)
+        && len > max
+    {
+        return PipeError::PipeTooLarge.into_response();
     }
 
     // For raw uploads, capture Content-Type if provided
@@ -95,10 +98,10 @@ async fn handle_put(
 
     // Reject anything that isn't an http(s) URL up-front. Rules out file://,
     // junk values, and reduces SSRF surface even when the feature is enabled.
-    if let Some(ref url) = forward_url {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return PipeError::ForwardInvalidUrl.into_response();
-        }
+    if let Some(ref url) = forward_url
+        && !(url.starts_with("http://") || url.starts_with("https://"))
+    {
+        return PipeError::ForwardInvalidUrl.into_response();
     }
 
     #[cfg(feature = "forward")]
@@ -161,10 +164,8 @@ async fn handle_put(
     let (forward_tx, forward_task) = if let Some(url) = forward_url {
         info!("PUT key={key} forwarding to {url}");
         let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
-        let body_stream = tokio_stream::StreamExt::map(
-            ReceiverStream::new(rx),
-            Ok::<_, std::io::Error>,
-        );
+        let body_stream =
+            tokio_stream::StreamExt::map(ReceiverStream::new(rx), Ok::<_, std::io::Error>);
         // For raw uploads, forward Content-Length and Content-Type so an
         // S3 presigned PUT (which signs both) sees what it expects. Multipart
         // inbound Content-Length includes framing and the field's Content-Type
@@ -248,16 +249,16 @@ async fn stream_raw(
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
-                if let Ok(data) = frame.into_data() {
-                    if !data.is_empty() {
-                        if let Some(ref tx) = forward_tx {
-                            let _ = tx.send(data.clone()).await;
-                        }
+                if let Ok(data) = frame.into_data()
+                    && !data.is_empty()
+                {
+                    if let Some(ref tx) = forward_tx {
+                        let _ = tx.send(data.clone()).await;
+                    }
 
-                        if let Err(resp) = write_chunk(&entry, &state, &data).await {
-                            schedule_cleanup(key, state, entry);
-                            return resp;
-                        }
+                    if let Err(resp) = write_chunk(&entry, &state, &data).await {
+                        schedule_cleanup(key, state, entry);
+                        return resp;
                     }
                 }
             }
@@ -384,12 +385,12 @@ async fn write_chunk(
 
     // Per-pipe size limit (catches streaming uploads with no Content-Length,
     // and multipart uploads where the inbound CL isn't meaningful).
-    if let Some(max) = state.max_pipe_size {
-        if entry.written.load(Ordering::Relaxed) + len > max {
-            entry.done.store(true, Ordering::Release);
-            entry.notify.notify_waiters();
-            return Err(PipeError::PipeTooLarge.into_response());
-        }
+    if let Some(max) = state.max_pipe_size
+        && entry.written.load(Ordering::Relaxed) + len > max
+    {
+        entry.done.store(true, Ordering::Release);
+        entry.notify.notify_waiters();
+        return Err(PipeError::PipeTooLarge.into_response());
     }
 
     // Reserve disk quota optimistically
@@ -423,8 +424,9 @@ async fn write_chunk(
             state.disk_usage.fetch_sub(len, Ordering::Relaxed);
             entry.done.store(true, Ordering::Release);
             entry.notify.notify_waiters();
-            return Err(PipeError::IoError(std::io::Error::other("missing file handle"))
-                .into_response());
+            return Err(
+                PipeError::IoError(std::io::Error::other("missing file handle")).into_response(),
+            );
         }
     };
     drop(file_guard);
@@ -472,11 +474,11 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
                 // Clean up the waiter if we're the last one holding it.
                 // The DashMap shard lock ensures no one can clone the Arc
                 // between our strong_count check and the remove.
-                if let dashmap::Entry::Occupied(e) = state.key_waiters.entry(key) {
-                    if Arc::strong_count(e.get()) == 2 {
-                        // 2 refs: the map entry + our local `waiter` clone
-                        e.remove();
-                    }
+                if let dashmap::Entry::Occupied(e) = state.key_waiters.entry(key)
+                    && Arc::strong_count(e.get()) == 2
+                {
+                    // 2 refs: the map entry + our local `waiter` clone
+                    e.remove();
                 }
 
                 return PipeError::KeyNotFound.into_response();
@@ -521,7 +523,11 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
 
         meta.last_get_at = Some(now);
         info!("GET key={key}");
-        (meta.content_length, meta.mime_type.clone(), meta.filename.clone())
+        (
+            meta.content_length,
+            meta.mime_type.clone(),
+            meta.filename.clone(),
+        )
     };
 
     // Stream the response
@@ -595,10 +601,7 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
     if let Some(ref name) = filename {
         // Sanitize: strip control chars (CR, LF, NUL) to prevent header injection,
         // and escape quotes for the quoted-string.
-        let safe: String = name
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect();
+        let safe: String = name.chars().filter(|c| !c.is_control()).collect();
         let safe = safe.replace('\\', "\\\\").replace('"', "\\\"");
 
         response = response.header(

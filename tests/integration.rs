@@ -450,9 +450,15 @@ async fn pipe_size_limit_aborts_oversize_streaming_upload() {
             .status()
     });
 
-    body_tx.send(Ok(Bytes::from("A".repeat(100)))).await.unwrap();
+    body_tx
+        .send(Ok(Bytes::from("A".repeat(100))))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    body_tx.send(Ok(Bytes::from("B".repeat(100)))).await.unwrap();
+    body_tx
+        .send(Ok(Bytes::from("B".repeat(100))))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     drop(body_tx);
 
@@ -498,7 +504,11 @@ async fn multipart_upload_preserves_filename_and_mime() {
     assert_eq!(resp.status(), 200);
 
     assert_eq!(
-        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "application/pdf"
     );
     assert_eq!(
@@ -520,8 +530,10 @@ async fn multipart_upload_without_metadata() {
     let client = Client::new();
 
     // Part without filename or explicit mime type
-    let form = reqwest::multipart::Form::new()
-        .part("data", reqwest::multipart::Part::bytes(b"just data".to_vec()));
+    let form = reqwest::multipart::Form::new().part(
+        "data",
+        reqwest::multipart::Part::bytes(b"just data".to_vec()),
+    );
 
     let resp = client
         .put(format!("{base}/mp-plain"))
@@ -559,7 +571,11 @@ async fn raw_upload_preserves_content_type() {
     let resp = client.get(format!("{base}/typed")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "image/png"
     );
     assert_eq!(resp.text().await.unwrap(), "fake png data");
@@ -616,7 +632,9 @@ async fn multipart_filename_control_chars_are_stripped() {
     let boundary = "----testboundary9876";
     let mut body = Vec::new();
     body.extend_from_slice(b"------testboundary9876\r\n");
-    body.extend_from_slice(b"Content-Disposition: form-data; name=\"file\"; filename=\"evil\tfile.txt\"\r\n");
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"file\"; filename=\"evil\tfile.txt\"\r\n",
+    );
     body.extend_from_slice(b"Content-Type: text/plain\r\n");
     body.extend_from_slice(b"\r\n");
     body.extend_from_slice(b"payload\r\n");
@@ -869,11 +887,8 @@ async fn forward_timeout_aborts_hung_upstream() {
     let hung_addr = hung.local_addr().unwrap();
     let _hung_task = tokio::spawn(async move {
         let mut conns = Vec::new();
-        loop {
-            match hung.accept().await {
-                Ok((stream, _)) => conns.push(stream),
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = hung.accept().await {
+            conns.push(stream);
         }
     });
 
@@ -929,9 +944,17 @@ async fn forward_propagates_content_type_for_raw_upload() {
 
     assert_eq!(resp.status(), 200);
 
-    let resp = client.get(format!("{target_base}/ct")).send().await.unwrap();
+    let resp = client
+        .get(format!("{target_base}/ct"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
-        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "application/x-custom"
     );
 }
@@ -994,7 +1017,11 @@ async fn active_transfers_track_in_flight_only() {
         .unwrap();
 
     assert_eq!(srv.pipes_count(), 1, "entry should still be in TTL window");
-    assert_eq!(srv.active_transfers(), 0, "upload finished, no in-flight transfer");
+    assert_eq!(
+        srv.active_transfers(),
+        0,
+        "upload finished, no in-flight transfer"
+    );
 }
 
 #[tokio::test]
@@ -1013,12 +1040,20 @@ async fn health_and_metrics_endpoints() {
     let client = Client::new();
 
     // /health → 200 ok
-    let resp = client.get(format!("{metrics_base}/health")).send().await.unwrap();
+    let resp = client
+        .get(format!("{metrics_base}/health"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "ok\n");
 
     // /metrics with no pipes → pipes 0
-    let resp = client.get(format!("{metrics_base}/metrics")).send().await.unwrap();
+    let resp = client
+        .get(format!("{metrics_base}/metrics"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("pipes 0"), "body was: {body}");
@@ -1026,19 +1061,36 @@ async fn health_and_metrics_endpoints() {
     assert!(body.contains("draining 0"), "body was: {body}");
 
     // Upload, then /metrics should report 1 pipe
-    client.put(format!("{data_base}/k")).body("hi").send().await.unwrap();
+    client
+        .put(format!("{data_base}/k"))
+        .body("hi")
+        .send()
+        .await
+        .unwrap();
 
-    let resp = client.get(format!("{metrics_base}/metrics")).send().await.unwrap();
+    let resp = client
+        .get(format!("{metrics_base}/metrics"))
+        .send()
+        .await
+        .unwrap();
     let body = resp.text().await.unwrap();
     assert!(body.contains("pipes 1"), "body was: {body}");
 
     // Data plane should NOT serve /health
-    let resp = client.get(format!("{data_base}/health")).send().await.unwrap();
+    let resp = client
+        .get(format!("{data_base}/health"))
+        .send()
+        .await
+        .unwrap();
     // /health on the data plane is treated as a key — and the key doesn't exist
     assert_eq!(resp.status(), 404);
 
     // Unknown path on the metrics listener → 404
-    let resp = client.get(format!("{metrics_base}/nope")).send().await.unwrap();
+    let resp = client
+        .get(format!("{metrics_base}/nope"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -1286,11 +1338,7 @@ async fn large_file_integrity() {
         .await
         .unwrap();
 
-    let resp = client
-        .get(format!("{base}/bigfile"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{base}/bigfile")).send().await.unwrap();
 
     assert_eq!(resp.status(), 200);
     let received = resp.bytes().await.unwrap();
@@ -1316,7 +1364,7 @@ async fn writer_disconnect_mid_upload() {
             .body(reqwest::Body::wrap_stream(body_stream))
             .send()
             .await
-    .unwrap();
+            .unwrap();
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1372,11 +1420,7 @@ async fn key_reusable_after_cleanup() {
         .await
         .unwrap();
 
-    let resp = client
-        .get(format!("{base}/reuse"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{base}/reuse")).send().await.unwrap();
 
     assert_eq!(resp.text().await.unwrap(), "first");
 
@@ -1391,11 +1435,7 @@ async fn key_reusable_after_cleanup() {
         .await
         .unwrap();
 
-    let resp = client
-        .get(format!("{base}/reuse"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{base}/reuse")).send().await.unwrap();
 
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "second");
@@ -1510,10 +1550,7 @@ async fn get_cleanup_waits_for_upload_to_finish() {
     assert_eq!(put_status, 200);
 
     let received = get_handle.await.unwrap();
-    assert_eq!(
-        String::from_utf8(received).unwrap(),
-        "chunk1-chunk2-chunk3"
-    );
+    assert_eq!(String::from_utf8(received).unwrap(), "chunk1-chunk2-chunk3");
 
     // A second GET after upload completed should also work
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1602,8 +1639,7 @@ async fn concurrent_readers_streaming_stress() {
 
     for iteration in 0..10 {
         let key = format!("spill-race-{iteration}");
-        let (body_tx, body_rx) =
-            tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(1);
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(1);
         let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
 
         let base_put = base.clone();
@@ -1768,7 +1804,7 @@ async fn key_with_unicode_and_special_chars() {
     let client = Client::new();
 
     // Keys with various special characters
-    let keys = vec![
+    let keys = [
         "hello%20world",
         "path/with/slashes",
         "dots...lots",
@@ -1902,10 +1938,7 @@ async fn reader_disconnect_doesnt_break_upload() {
 
         let mut stream = resp.bytes_stream();
 
-        body_tx
-            .send(Ok(Bytes::from("chunk1")))
-            .await
-            .unwrap();
+        body_tx.send(Ok(Bytes::from("chunk1"))).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Read one chunk then drop the stream (disconnect)
@@ -1913,14 +1946,8 @@ async fn reader_disconnect_doesnt_break_upload() {
     }
 
     // Continue uploading — should not fail
-    body_tx
-        .send(Ok(Bytes::from("chunk2")))
-        .await
-        .unwrap();
-    body_tx
-        .send(Ok(Bytes::from("chunk3")))
-        .await
-        .unwrap();
+    body_tx.send(Ok(Bytes::from("chunk2"))).await.unwrap();
+    body_tx.send(Ok(Bytes::from("chunk3"))).await.unwrap();
     drop(body_tx);
 
     let put_status = put_handle.await.unwrap();
@@ -1983,7 +2010,11 @@ async fn many_concurrent_puts_no_interference() {
             assert_eq!(resp.status(), 200);
             let received = resp.bytes().await.unwrap();
             let expected: Vec<u8> = (0..1000).map(|j| ((i * 7 + j) % 256) as u8).collect();
-            assert_eq!(received.as_ref(), expected.as_slice(), "key concurrent-{i} mismatch");
+            assert_eq!(
+                received.as_ref(),
+                expected.as_slice(),
+                "key concurrent-{i} mismatch"
+            );
         }));
     }
 
@@ -2027,19 +2058,11 @@ async fn unsupported_methods_return_405() {
     let base = base_url(&srv);
     let client = Client::new();
 
-    let resp = client
-        .delete(format!("{base}/test"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.delete(format!("{base}/test")).send().await.unwrap();
 
     assert_eq!(resp.status(), 405);
 
-    let resp = client
-        .patch(format!("{base}/test"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.patch(format!("{base}/test")).send().await.unwrap();
 
     assert_eq!(resp.status(), 405);
 }
@@ -2131,15 +2154,15 @@ async fn multipart_large_file_integrity() {
 
     assert_eq!(resp.status(), 200);
 
-    let resp = client
-        .get(format!("{base}/mp-big"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{base}/mp-big")).send().await.unwrap();
 
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "application/octet-stream"
     );
     assert_eq!(

@@ -72,7 +72,9 @@ impl PipeError {
             Self::UploadError(e) => format!("upload failed: {e}"),
             #[cfg(feature = "forward")]
             Self::ForwardError(e) => format!("forward failed: {e}"),
-            Self::ForwardDisabled => "X-Forward-Url is disabled; start the server with --allow-forward to enable".into(),
+            Self::ForwardDisabled => {
+                "X-Forward-Url is disabled; start the server with --allow-forward to enable".into()
+            }
             Self::ForwardInvalidUrl => "X-Forward-Url must be an http:// or https:// URL".into(),
             Self::PipeTooLarge => "upload exceeds max pipe size".into(),
         }

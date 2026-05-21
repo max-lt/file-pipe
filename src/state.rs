@@ -107,10 +107,10 @@ pub(crate) async fn free_entry(state: &AppState, key: &str, entry: &PipeEntry) {
     let written = entry.written.load(Ordering::Relaxed);
     state.disk_usage.fetch_sub(written, Ordering::Relaxed);
 
-    if let Err(e) = crate::io::remove(&entry.path).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!("cleanup key={key} failed to remove file: {e}");
-        }
+    if let Err(e) = crate::io::remove(&entry.path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!("cleanup key={key} failed to remove file: {e}");
     }
 
     debug!("cleanup key={key} removed ({written} bytes freed)");
