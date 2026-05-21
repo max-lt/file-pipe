@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -52,6 +52,42 @@ pub struct AppState {
     /// Reqwest client used for forward uploads (built once at startup).
     #[cfg(feature = "forward")]
     pub forward_client: reqwest::Client,
+    /// Uploads currently streaming a body into a pipe.
+    pub active_uploads: AtomicUsize,
+    /// Downloads currently streaming bytes out of a pipe.
+    pub active_downloads: AtomicUsize,
+}
+
+/// RAII guard that increments `active_uploads` on construction and decrements on drop.
+pub struct UploadGuard(Arc<AppState>);
+
+impl UploadGuard {
+    pub fn new(state: Arc<AppState>) -> Self {
+        state.active_uploads.fetch_add(1, Ordering::Relaxed);
+        Self(state)
+    }
+}
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        self.0.active_uploads.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII guard that increments `active_downloads` on construction and decrements on drop.
+pub struct DownloadGuard(Arc<AppState>);
+
+impl DownloadGuard {
+    pub fn new(state: Arc<AppState>) -> Self {
+        state.active_downloads.fetch_add(1, Ordering::Relaxed);
+        Self(state)
+    }
+}
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        self.0.active_downloads.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Remove a key's entry only if it is the exact same Arc (pointer equality).

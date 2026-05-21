@@ -126,7 +126,10 @@ async fn main() {
 }
 
 async fn wait_until_drained(handle: &file_pipe::ServerHandle) {
-    while handle.pipes_count() > 0 {
+    // Wait for in-flight transfers to finish. Entries still in their
+    // post-upload TTL window aren't transferring anymore, so we don't
+    // wait on them — cleanup() removes them all on exit.
+    while handle.active_transfers() > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }

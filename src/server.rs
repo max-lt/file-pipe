@@ -75,6 +75,12 @@ impl ServerHandle {
         self.state.pipes.len()
     }
 
+    /// Number of transfers currently streaming bytes (uploads + downloads).
+    pub fn active_transfers(&self) -> usize {
+        self.state.active_uploads.load(Ordering::Relaxed)
+            + self.state.active_downloads.load(Ordering::Relaxed)
+    }
+
     /// Number of pending key waiters (GETs waiting for a non-existent key).
     pub fn key_waiters_count(&self) -> usize {
         self.state.key_waiters.len()
@@ -141,6 +147,8 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
             .timeout(std::time::Duration::from_secs(config.forward_timeout))
             .build()
             .expect("failed to build reqwest client"),
+        active_uploads: std::sync::atomic::AtomicUsize::new(0),
+        active_downloads: std::sync::atomic::AtomicUsize::new(0),
     });
 
     let listener = TcpListener::bind(&config.addr).await?;
@@ -234,10 +242,12 @@ fn metrics_handle(req: Request<Incoming>, state: &AppState) -> Response<BoxBody>
             let disk_usage = state.disk_usage.load(Ordering::Relaxed);
             let key_waiters = state.key_waiters.len();
             let draining = state.draining.load(Ordering::Relaxed) as u8;
+            let active_uploads = state.active_uploads.load(Ordering::Relaxed);
+            let active_downloads = state.active_downloads.load(Ordering::Relaxed);
             (
                 StatusCode::OK,
                 format!(
-                    "pipes {pipes}\ndisk_usage {disk_usage}\nkey_waiters {key_waiters}\ndraining {draining}\n"
+                    "pipes {pipes}\ndisk_usage {disk_usage}\nkey_waiters {key_waiters}\nactive_uploads {active_uploads}\nactive_downloads {active_downloads}\ndraining {draining}\n"
                 ),
             )
         }

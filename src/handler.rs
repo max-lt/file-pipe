@@ -12,7 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info};
 
 use crate::error::{BoxBody, PipeError, ok_response};
-use crate::state::{AppState, PipeEntry, PipeMetadata, cleanup_entry};
+use crate::state::{AppState, DownloadGuard, PipeEntry, PipeMetadata, UploadGuard, cleanup_entry};
 
 /// Extract the multipart boundary from Content-Type, if present.
 fn multipart_boundary(req: &Request<Incoming>) -> Option<String> {
@@ -199,6 +199,8 @@ async fn handle_put(
     let forward_tx: Option<tokio::sync::mpsc::Sender<Bytes>> = None;
 
     info!("PUT key={key} upload started");
+
+    let _upload_guard = UploadGuard::new(state.clone());
 
     let resp = if let Some(boundary) = boundary {
         stream_multipart(key, req.into_body(), boundary, entry, state, forward_tx).await
@@ -525,7 +527,9 @@ async fn handle_get(key: String, state: Arc<AppState>) -> Response<BoxBody> {
     // Stream the response
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
 
+    let download_state = state.clone();
     tokio::spawn(async move {
+        let _download_guard = DownloadGuard::new(download_state);
         let mut pos: u64 = 0;
 
         loop {

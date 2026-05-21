@@ -976,6 +976,28 @@ async fn forward_propagates_content_length_for_raw_upload() {
 }
 
 #[tokio::test]
+async fn active_transfers_track_in_flight_only() {
+    // pipes_count includes entries in the TTL window; active_transfers
+    // only counts transfers currently streaming bytes. After a fast
+    // upload completes, pipes_count > 0 but active_transfers == 0.
+    let srv = spawn_server().await;
+    let base = base_url(&srv);
+
+    assert_eq!(srv.active_transfers(), 0);
+    assert_eq!(srv.pipes_count(), 0);
+
+    Client::new()
+        .put(format!("{base}/x"))
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(srv.pipes_count(), 1, "entry should still be in TTL window");
+    assert_eq!(srv.active_transfers(), 0, "upload finished, no in-flight transfer");
+}
+
+#[tokio::test]
 async fn health_and_metrics_endpoints() {
     let srv = file_pipe::start_server(file_pipe::ServerConfig {
         addr: "127.0.0.1:0".into(),

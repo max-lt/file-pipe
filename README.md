@@ -90,8 +90,12 @@ GET /metrics  → 200 plain text:
                 pipes 5
                 disk_usage 1048576
                 key_waiters 2
+                active_uploads 1
+                active_downloads 3
                 draining 0
 ```
+
+`pipes` includes entries still held in their TTL window after upload; `active_uploads`/`active_downloads` only count transfers currently streaming bytes. Graceful shutdown waits on the active counters, not on `pipes`.
 
 ## Logging
 
