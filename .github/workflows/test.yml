@@ -15,8 +15,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Default build
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Clippy (default)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (forward feature)
+        run: cargo clippy --all-targets --features forward -- -D warnings
+      - name: Test (default)
         run: cargo test --verbose
-      - name: With forward feature
+      - name: Test (forward feature)
         run: cargo test --features forward --verbose
