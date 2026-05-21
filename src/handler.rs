@@ -120,7 +120,7 @@ async fn handle_put(
     let entry = Arc::new(PipeEntry {
         meta: tokio::sync::Mutex::new(PipeMetadata {
             content_length,
-            mime_type: raw_content_type,
+            mime_type: raw_content_type.clone(),
             filename: None,
             upload_ended_at: None,
             first_get_at: None,
@@ -165,11 +165,15 @@ async fn handle_put(
             ReceiverStream::new(rx),
             Ok::<_, std::io::Error>,
         );
-        // For raw uploads with a known size, forward Content-Length so the
-        // upstream (e.g. an S3 presigned PUT signed with a fixed size) gets
-        // a proper header instead of chunked transfer encoding. Multipart
-        // inbound Content-Length includes framing and is not meaningful.
-        let forward_content_length = if boundary.is_none() { content_length } else { None };
+        // For raw uploads, forward Content-Length and Content-Type so an
+        // S3 presigned PUT (which signs both) sees what it expects. Multipart
+        // inbound Content-Length includes framing and the field's Content-Type
+        // is only known after parsing the body — both stay chunked.
+        let (forward_content_length, forward_content_type) = if boundary.is_none() {
+            (content_length, raw_content_type)
+        } else {
+            (None, None)
+        };
         let task = tokio::spawn(async move {
             let mut req = reqwest::Client::new()
                 .put(url)
@@ -177,6 +181,10 @@ async fn handle_put(
 
             if let Some(len) = forward_content_length {
                 req = req.header(reqwest::header::CONTENT_LENGTH, len);
+            }
+
+            if let Some(ct) = forward_content_type {
+                req = req.header(reqwest::header::CONTENT_TYPE, ct);
             }
 
             req.send().await

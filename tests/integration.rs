@@ -862,6 +862,36 @@ async fn forward_streaming_upload() {
 
 #[cfg(feature = "forward")]
 #[tokio::test]
+async fn forward_propagates_content_type_for_raw_upload() {
+    // S3 presigned PUTs sign Content-Type; the upstream must see what the
+    // client sent, not a default reqwest "application/octet-stream" or similar.
+    let target_srv = spawn_server().await;
+    let target_base = base_url(&target_srv);
+
+    let srv = spawn_server_with_forward().await;
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let resp = client
+        .put(format!("{base}/ct"))
+        .header("x-forward-url", format!("{target_base}/ct"))
+        .header("content-type", "application/x-custom")
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let resp = client.get(format!("{target_base}/ct")).send().await.unwrap();
+    assert_eq!(
+        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        "application/x-custom"
+    );
+}
+
+#[cfg(feature = "forward")]
+#[tokio::test]
 async fn forward_propagates_content_length_for_raw_upload() {
     // S3 presigned PUTs are typically signed with a fixed Content-Length, so
     // forwarding without one (default reqwest chunked) returns 403 from S3.
