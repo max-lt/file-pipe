@@ -37,6 +37,9 @@ pub struct ServerConfig {
     /// SSRF risk if the server is exposed to untrusted clients.
     #[cfg(feature = "forward")]
     pub allow_forward: bool,
+    /// Timeout in seconds for forward (X-Forward-Url) requests (default: 60s).
+    #[cfg(feature = "forward")]
+    pub forward_timeout: u64,
     /// Optional separate listener exposing /health and /metrics (default: off).
     pub metrics_addr: Option<String>,
 }
@@ -53,6 +56,8 @@ impl Default for ServerConfig {
             get_wait_timeout: 5,
             #[cfg(feature = "forward")]
             allow_forward: false,
+            #[cfg(feature = "forward")]
+            forward_timeout: 60,
             metrics_addr: None,
         }
     }
@@ -131,6 +136,11 @@ pub async fn start_server(config: ServerConfig) -> std::io::Result<ServerHandle>
         get_wait_timeout: config.get_wait_timeout,
         #[cfg(feature = "forward")]
         allow_forward: config.allow_forward,
+        #[cfg(feature = "forward")]
+        forward_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.forward_timeout))
+            .build()
+            .expect("failed to build reqwest client"),
     });
 
     let listener = TcpListener::bind(&config.addr).await?;

@@ -862,6 +862,52 @@ async fn forward_streaming_upload() {
 
 #[cfg(feature = "forward")]
 #[tokio::test]
+async fn forward_timeout_aborts_hung_upstream() {
+    // A TCP listener that accepts but never responds. Reqwest's per-request
+    // timeout should fire and the local PUT returns 502 within a few seconds.
+    let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hung_addr = hung.local_addr().unwrap();
+    let _hung_task = tokio::spawn(async move {
+        let mut conns = Vec::new();
+        loop {
+            match hung.accept().await {
+                Ok((stream, _)) => conns.push(stream),
+                Err(_) => break,
+            }
+        }
+    });
+
+    let srv = file_pipe::start_server(file_pipe::ServerConfig {
+        addr: "127.0.0.1:0".into(),
+        data_dir: fresh_data_dir(),
+        allow_forward: true,
+        forward_timeout: 1, // 1 second
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let base = base_url(&srv);
+    let client = Client::new();
+
+    let start = Instant::now();
+    let resp = client
+        .put(format!("{base}/timeout"))
+        .header("x-forward-url", format!("http://{hung_addr}/anything"))
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp.status(), 502);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "forward timeout did not fire promptly: {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "forward")]
+#[tokio::test]
 async fn forward_propagates_content_type_for_raw_upload() {
     // S3 presigned PUTs sign Content-Type; the upstream must see what the
     // client sent, not a default reqwest "application/octet-stream" or similar.

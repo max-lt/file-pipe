@@ -49,6 +49,9 @@ pub struct AppState {
     /// Allow X-Forward-Url to tee uploads to an external URL.
     #[cfg(feature = "forward")]
     pub allow_forward: bool,
+    /// Reqwest client used for forward uploads (built once at startup).
+    #[cfg(feature = "forward")]
+    pub forward_client: reqwest::Client,
 }
 
 /// Remove a key's entry only if it is the exact same Arc (pointer equality).

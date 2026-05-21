@@ -41,6 +41,11 @@ struct Args {
     #[arg(long, env = "ALLOW_FORWARD")]
     allow_forward: bool,
 
+    /// Timeout in seconds for forward (X-Forward-Url) requests (default: 60)
+    #[cfg(feature = "forward")]
+    #[arg(long, default_value_t = 60, env = "FORWARD_TIMEOUT")]
+    forward_timeout: u64,
+
     /// Optional separate listener exposing /health and /metrics.
     /// Bind to localhost (e.g. 127.0.0.1:9090) to keep stats off the data plane.
     #[arg(long, env = "METRICS_ADDR")]
@@ -83,6 +88,8 @@ async fn main() {
         get_wait_timeout: args.get_wait_timeout,
         #[cfg(feature = "forward")]
         allow_forward: args.allow_forward,
+        #[cfg(feature = "forward")]
+        forward_timeout: args.forward_timeout,
         metrics_addr: args.metrics_addr,
     };
 

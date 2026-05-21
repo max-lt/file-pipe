@@ -174,8 +174,9 @@ async fn handle_put(
         } else {
             (None, None)
         };
+        let client = state.forward_client.clone();
         let task = tokio::spawn(async move {
-            let mut req = reqwest::Client::new()
+            let mut req = client
                 .put(url)
                 .body(reqwest::Body::wrap_stream(body_stream));
 
