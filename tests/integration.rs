@@ -1039,13 +1039,21 @@ async fn health_and_metrics_endpoints() {
     let metrics_base = format!("http://{}", srv.metrics_addr.unwrap());
     let client = Client::new();
 
-    // /health → 200 ok
+    // /health → 200 ok, no-store so caches don't hold a stale green
     let resp = client
         .get(format!("{metrics_base}/health"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no-store"
+    );
     assert_eq!(resp.text().await.unwrap(), "ok\n");
 
     // /metrics with no pipes → pipes 0

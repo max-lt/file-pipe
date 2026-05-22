@@ -252,6 +252,7 @@ fn metrics_handle(req: Request<Incoming>, state: &AppState) -> Response<BoxBody>
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "text/plain")
+        .header(hyper::header::CACHE_CONTROL, "no-store")
         .body(
             Full::new(Bytes::from(body))
                 .map_err(|never| match never {})
