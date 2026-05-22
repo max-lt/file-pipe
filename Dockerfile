@@ -1,8 +1,8 @@
-FROM rust:1.92-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin file-pipe
+RUN cargo build --release --bin file-pipe --features forward
 
 FROM debian:bookworm-slim
 

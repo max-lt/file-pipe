@@ -60,6 +60,8 @@ The feature is off by default because it brings in `reqwest` + `rustls`, which r
 
 ## Docker
 
+Both Dockerfiles build with `--features forward` enabled. The image is the "full" build — `X-Forward-Url` works at runtime when you add `--allow-forward`.
+
 ```bash
 # Simple build
 docker build -t file-pipe .
