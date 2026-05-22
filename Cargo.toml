@@ -2,6 +2,21 @@
 name = "file-pipe"
 version = "0.1.0"
 edition = "2024"
+description = "HTTP pipe service — stream uploads to downloads in real-time"
+repository = "https://github.com/max-lt/file-pipe"
+keywords = ["http", "pipe", "streaming", "upload", "s3"]
+categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [dependencies]
 bytes = "1"

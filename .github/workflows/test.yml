@@ -21,9 +21,9 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
       - name: Clippy (default)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets
       - name: Clippy (forward feature)
-        run: cargo clippy --all-targets --features forward -- -D warnings
+        run: cargo clippy --all-targets --features forward
       - name: Test (default)
         run: cargo test --verbose
       - name: Test (forward feature)
